@@ -1,0 +1,226 @@
+// 转发器：手动构造上游 *http.Request（非 httputil.ReverseProxy），
+// 头部白名单透传 + 鉴权注入 + body 模型改写 + SSE 管道式透传。
+// 对齐 sub2api 的 gateway_forward / gateway_anthropic_passthrough 模式。
+package gateway
+
+import (
+	"bufio"
+	"bytes"
+	"context"
+	"encoding/json"
+	"fmt"
+	"io"
+	"net/http"
+	"strings"
+	"time"
+
+	"github.com/gin-gonic/gin"
+)
+
+// UpstreamError 表示上游返回了非 2xx 状态码（已读取错误体，响应未提交，可 fallback）。
+type UpstreamError struct {
+	Status int
+	Body   string
+}
+
+func (e *UpstreamError) Error() string {
+	return fmt.Sprintf("upstream %d: %s", e.Status, e.Body)
+}
+
+// Forwarder 持有共享的 *http.Client（流式安全：Timeout=0，由请求级 context 控制截止）。
+type Forwarder struct {
+	client *http.Client
+}
+
+func NewForwarder() *Forwarder {
+	return &Forwarder{client: &http.Client{Timeout: 0}}
+}
+
+// allowedHeaders 是从客户端透传到上游的头部白名单（小写），其余一律丢弃。
+// 刻意剥离 authorization / x-api-key / cookie 等，避免泄露客户端凭据。
+var allowedHeaders = map[string]bool{
+	"accept":          true,
+	"user-agent":      true,
+	"accept-language": true,
+	"accept-encoding": true,
+}
+
+// Forward 把请求体转发到指定上游模型。
+// streamRequested=true 时做 SSE 管道透传；否则原样透传非流式响应。
+// 返回 ForwardResult 与 error：
+//   - 非 2xx：返回 *UpstreamError，BodyCommitted=false，调用方可据状态码决定重试/fallback
+//   - 传输错误：返回普通 error，BodyCommitted=false
+//   - 已开始写响应体后出错：BodyCommitted=true，不可再 fallback
+func (f *Forwarder) Forward(ctx context.Context, c *gin.Context, body []byte, m *Model, streamRequested bool) (*ForwardResult, error) {
+	ctx, cancel := context.WithTimeout(ctx, m.Timeout)
+	defer cancel()
+
+	upBody, err := rewriteModel(body, m.Cfg.Upstream.Model)
+	if err != nil {
+		return &ForwardResult{}, fmt.Errorf("rewrite model: %w", err)
+	}
+	url := buildURL(m.Cfg.Upstream.BaseURL)
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(upBody))
+	if err != nil {
+		return &ForwardResult{}, err
+	}
+	// 头部白名单透传
+	for h, vals := range c.Request.Header {
+		if allowedHeaders[strings.ToLower(h)] {
+			for _, v := range vals {
+				req.Header.Add(h, v)
+			}
+		}
+	}
+	req.Header.Set("Content-Type", "application/json")
+	setAuth(req, m)
+
+	start := time.Now()
+	resp, err := f.client.Do(req)
+	if err != nil {
+		return &ForwardResult{DurationMs: ms(time.Since(start))}, err
+	}
+
+	// 非 2xx：读取错误体后返回，不提交响应体（可 fallback）
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		errBody, _ := io.ReadAll(io.LimitReader(resp.Body, 8*1024))
+		resp.Body.Close()
+		return &ForwardResult{Status: resp.StatusCode, DurationMs: ms(time.Since(start))},
+			&UpstreamError{Status: resp.StatusCode, Body: string(errBody)}
+	}
+
+	res := &ForwardResult{Status: resp.StatusCode, UpstreamModel: m.Cfg.Upstream.Model, Stream: streamRequested}
+	begin := time.Now()
+	if streamRequested {
+		res.FirstTokenMs, err = f.pipeSSE(ctx, c, resp, m, begin)
+	} else {
+		err = f.pipeNonStream(c, resp)
+	}
+	res.BodyCommitted = true
+	res.DurationMs = ms(time.Since(start))
+	return res, err
+}
+
+// buildURL 规整 base_url：已含 /chat/completions 则原样，否则追加 /v1/chat/completions。
+func buildURL(baseURL string) string {
+	b := strings.TrimRight(baseURL, "/")
+	if strings.HasSuffix(b, "/chat/completions") {
+		return b
+	}
+	return b + "/v1/chat/completions"
+}
+
+// setAuth 按配置注入鉴权头（Authorization: Bearer / x-api-key / x-goog-api-key / 自定义）。
+func setAuth(req *http.Request, m *Model) {
+	h := strings.ToLower(strings.TrimSpace(m.Cfg.Upstream.AuthHeader))
+	switch h {
+	case "", "authorization", "bearer":
+		req.Header.Set("Authorization", "Bearer "+m.Cfg.Upstream.APIKey)
+	case "x-api-key":
+		req.Header.Set("x-api-key", m.Cfg.Upstream.APIKey)
+	case "x-goog-api-key":
+		req.Header.Set("x-goog-api-key", m.Cfg.Upstream.APIKey)
+	default:
+		req.Header.Set(m.Cfg.Upstream.AuthHeader, m.Cfg.Upstream.APIKey)
+	}
+}
+
+// rewriteModel 用上游真实模型名改写 body 中的 "model" 字段（模型映射）。
+// 使用 map[string]json.RawMessage 保留其余字段原样。
+func rewriteModel(body []byte, newModel string) ([]byte, error) {
+	var obj map[string]json.RawMessage
+	if err := json.Unmarshal(body, &obj); err != nil {
+		return nil, err
+	}
+	if obj == nil {
+		obj = map[string]json.RawMessage{}
+	}
+	b, err := json.Marshal(newModel)
+	if err != nil {
+		return nil, err
+	}
+	obj["model"] = b
+	return json.Marshal(obj)
+}
+
+// pipeSSE 做 SSE 管道式透传：逐行读上游、立即 Flush、空闲超时、keepalive ping。
+func (f *Forwarder) pipeSSE(ctx context.Context, c *gin.Context, resp *http.Response, m *Model, begin time.Time) (int64, error) {
+	defer resp.Body.Close()
+	w := c.Writer
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("Connection", "keep-alive")
+	w.Header().Set("X-Accel-Buffering", "no") // 禁用 nginx 缓冲
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		return 0, fmt.Errorf("server writer 不支持 streaming")
+	}
+	w.WriteHeader(http.StatusOK)
+	flusher.Flush()
+
+	lines := make(chan string, 16)
+	errCh := make(chan error, 1)
+	go func() {
+		scanner := bufio.NewScanner(resp.Body)
+		scanner.Buffer(make([]byte, 0, 64*1024), 64*1024*1024) // 单行最大 64MB
+		for scanner.Scan() {
+			lines <- scanner.Text()
+		}
+		if err := scanner.Err(); err != nil {
+			errCh <- err
+		} else {
+			errCh <- nil
+		}
+		close(lines)
+	}()
+
+	var firstTokenMs int64
+	started := false
+	idle := time.NewTimer(m.IdleTimeout)
+	defer idle.Stop()
+	keepalive := time.NewTicker(m.Keepalive)
+	defer keepalive.Stop()
+
+	for {
+		select {
+		case line, ok := <-lines:
+			if !ok {
+				return firstTokenMs, <-errCh
+			}
+			if !started {
+				firstTokenMs = ms(time.Since(begin))
+				started = true
+			}
+			if _, err := fmt.Fprintln(w, line); err != nil {
+				return firstTokenMs, nil // 客户端已断开
+			}
+			flusher.Flush()
+			idle.Reset(m.IdleTimeout)
+		case <-keepalive.C:
+			if _, err := fmt.Fprint(w, ": keepalive\n\n"); err != nil {
+				return firstTokenMs, nil
+			}
+			flusher.Flush()
+		case <-idle.C:
+			return firstTokenMs, fmt.Errorf("stream idle timeout after %s", m.IdleTimeout)
+		case <-ctx.Done():
+			return firstTokenMs, ctx.Err()
+		case <-c.Request.Context().Done():
+			return firstTokenMs, nil // 客户端断开
+		}
+	}
+}
+
+// pipeNonStream 透传非流式响应（2xx），原样写状态码、Content-Type 与 body。
+func (f *Forwarder) pipeNonStream(c *gin.Context, resp *http.Response) error {
+	defer resp.Body.Close()
+	w := c.Writer
+	if ct := resp.Header.Get("Content-Type"); ct != "" {
+		w.Header().Set("Content-Type", ct)
+	}
+	w.WriteHeader(resp.StatusCode)
+	_, err := io.Copy(w, resp.Body)
+	return err
+}
+
+func ms(d time.Duration) int64 { return d.Milliseconds() }

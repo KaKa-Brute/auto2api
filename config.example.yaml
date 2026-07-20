@@ -1,0 +1,110 @@
+# auto2api 配置：支持多套命名链，外部按 model=链名 调用不同优先级组
+# 客户端请求体里 "model" 字段填链名（如 "auto" / "cn"），即按对应链的优先级 fallback
+# 复制本文件为 config.yaml 并填入真实凭据后使用
+server:
+  addr: ":8080"
+  max_model_switches: 5          # 单次请求最多切换模型次数（兜底，防雪崩）
+  api_keys:                      # 服务级鉴权 key，客户端调用须在 Authorization: Bearer <key> 填其中之一；为空则不鉴权
+    - "sk-auto2api-CHANGE_ME"     # 可配多个方便轮换；支持 ${ENV} 展开
+    # - "${AUTO2API_KEY2}"
+
+chains:
+  # 默认链：gpt -> glm -> claude 三级 fallback
+  auto:
+    - name: gpt              # 优先级 1（最高）
+      priority: 1
+      upstream:
+        provider: openai
+        base_url: "https://api.openai.com/v1"   # OpenAI 兼容端点会自动追加 /v1/chat/completions
+        model: "gpt-4o"        # 上游真实模型名（模型映射）
+        api_key: "${OPENAI_KEY}"                # 支持 ${ENV} 环境变量展开
+        auth_header: "Authorization"            # 或 x-api-key / x-goog-api-key
+        timeout: "120s"
+      retry:
+        count: 2                                # 同模型内重试次数（不含首次）
+        backoff: ["300ms", "600ms", "1.2s"]     # 指数退避，封顶 3s
+        retryable_status: [429, 500, 502, 503, 529]
+      failover:
+        trigger_status: [401, 403, 429, 500, 502, 503, 529]   # 触发切换下一优先级
+        cooldown: "60s"                         # 失败后该模型冷却不可用时间
+      stream:
+        idle_timeout: "30s"                     # SSE 无数据超时
+        keepalive: "5s"                          # SSE ping 间隔
+
+    - name: glm             # 优先级 2
+      priority: 2
+      upstream:
+        provider: openai
+        base_url: "https://open.bigmodel.cn/api/paas/v4"
+        model: "glm-4-plus"
+        api_key: "${GLM_KEY}"
+        auth_header: "Authorization"
+        timeout: "120s"
+      retry:
+        count: 2
+        backoff: ["300ms", "600ms"]
+        retryable_status: [429, 500, 502]
+      failover:
+        trigger_status: [401, 403, 429, 500, 502, 503]
+        cooldown: "60s"
+      stream:
+        idle_timeout: "30s"
+        keepalive: "5s"
+
+    - name: claude            # 优先级 3（兜底）
+      priority: 3
+      upstream:
+        provider: anthropic
+        base_url: "https://api.anthropic.com"
+        model: "claude-3-5-sonnet-20241022"
+        api_key: "${ANTHROPIC_KEY}"
+        auth_header: "x-api-key"              # Anthropic 用 x-api-key
+        timeout: "120s"
+      retry:
+        count: 1
+        retryable_status: [429, 500]
+      failover:
+        trigger_status: [500, 502, 503]
+        cooldown: "30s"
+      stream:
+        idle_timeout: "30s"
+        keepalive: "5s"
+
+  # 第二套链：仅国产模型
+  cn:
+    - name: deepseek-cn
+      priority: 1
+      upstream:
+        base_url: "https://api.deepseek.com"
+        model: "deepseek-chat"
+        api_key: "${DEEPSEEK_KEY}"
+        auth_header: "Authorization"
+        timeout: "120s"
+      retry:
+        count: 2
+        backoff: ["300ms", "600ms"]
+        retryable_status: [429, 500]
+      failover:
+        trigger_status: [401, 403, 429, 500]
+        cooldown: "60s"
+      stream:
+        idle_timeout: "30s"
+        keepalive: "5s"
+
+    - name: qwen
+      priority: 2
+      upstream:
+        base_url: "https://dashscope.aliyuncs.com/compatible-mode"
+        model: "qwen-plus"
+        api_key: "${QWEN_KEY}"
+        auth_header: "Authorization"
+        timeout: "120s"
+      retry:
+        count: 1
+        retryable_status: [429]
+      failover:
+        trigger_status: [401, 403, 429, 500]
+        cooldown: "60s"
+      stream:
+        idle_timeout: "30s"
+        keepalive: "5s"
