@@ -169,6 +169,10 @@ func splitToolResults(blocks []interface{}) (toolMsgs []interface{}, rest []inte
 		}
 		if t, _ := m["type"].(string); t == "tool_result" {
 			id, _ := m["tool_use_id"].(string)
+			// 过滤掉 id 为空的无效 tool_result（客户端 bug 导致 tool_use_id 为 null）
+			if id == "" {
+				continue
+			}
 			content := extractToolResultContent(m["content"])
 			toolMsgs = append(toolMsgs, map[string]interface{}{
 				"role":         "tool",
@@ -220,6 +224,10 @@ func convertAssistantBlocks(blocks []interface{}) (converted interface{}, toolCa
 			}
 		case "tool_use":
 			id, _ := m["id"].(string)
+			// 过滤掉 id 为空的无效 tool_use（客户端 bug 导致 id 为 null）
+			if id == "" {
+				continue
+			}
 			name, _ := m["name"].(string)
 			input := m["input"]
 			args, _ := json.Marshal(input)
