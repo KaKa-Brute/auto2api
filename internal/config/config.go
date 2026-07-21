@@ -14,9 +14,11 @@ import (
 
 // Config 是整个配置文件的根结构。
 type Config struct {
-	Server ServerConfig            `yaml:"server"`
-	Log    LogConfig               `yaml:"log"`
-	Chains map[string]ChainConfig `yaml:"chains"`
+	Server      ServerConfig            `yaml:"server"`
+	Log         LogConfig               `yaml:"log"`
+	Breaker     BreakerConfig           `yaml:"breaker"`
+	HealthCheck HealthCheckConfig       `yaml:"health_check"`
+	Chains      map[string]ChainConfig `yaml:"chains"`
 }
 
 type ServerConfig struct {
@@ -73,6 +75,25 @@ type StreamConfig struct {
 	Keepalive   string `yaml:"keepalive"`   // SSE keepalive ping 间隔
 }
 
+// BreakerConfig 是熔断器全局配置（可选，未配则 enabled=false，熔断关闭）。
+// 熔断器叠加在 failover.cooldown 之上：单次失败短期冷却由 cooldown 控制，
+// 连续失败长期熔断 + 半开探测由本配置控制。
+type BreakerConfig struct {
+	Enabled          bool   `yaml:"enabled"`            // 总开关
+	FailureThreshold int    `yaml:"failure_threshold"`  // 连续失败多少次进入 OPEN
+	OpenDuration     string `yaml:"open_duration"`      // OPEN 持续时间，到期转 HALF_OPEN
+	HalfOpenMax      int    `yaml:"half_open_max"`      // HALF_OPEN 允许的并发探测请求数
+}
+
+// HealthCheckConfig 是后台主动探活配置（可选，未配则禁用）。
+// 启用后周期性对每个上游模型发 max_tokens=1 的最小请求，
+// 失败反馈熔断器触发 OPEN，成功复位熔断器 CLOSED。
+type HealthCheckConfig struct {
+	Enabled  bool   `yaml:"enabled"`           // 总开关
+	Interval string `yaml:"interval"`          // 探活周期（如 "30s"）
+	Timeout  string `yaml:"timeout"`           // 单次探活请求超时（如 "10s"）
+}
+
 var envRe = regexp.MustCompile(`\$\{([A-Z0-9_]+)\}`)
 
 // ExpandEnv 把 ${ENV} 替换成环境变量值。
@@ -119,6 +140,36 @@ func Load(path string) (*Config, error) {
 	}
 	if c.Log.BodyLimit <= 0 {
 		c.Log.BodyLimit = 64 * 1024
+	}
+	// 熔断器默认值
+	if c.Breaker.Enabled {
+		if c.Breaker.FailureThreshold <= 0 {
+			c.Breaker.FailureThreshold = 5
+		}
+		if c.Breaker.OpenDuration == "" {
+			c.Breaker.OpenDuration = "60s"
+		}
+		if _, err := time.ParseDuration(c.Breaker.OpenDuration); err != nil {
+			return nil, fmt.Errorf("breaker.open_duration: %w", err)
+		}
+		if c.Breaker.HalfOpenMax <= 0 {
+			c.Breaker.HalfOpenMax = 1
+		}
+	}
+	// 健康检查默认值
+	if c.HealthCheck.Enabled {
+		if c.HealthCheck.Interval == "" {
+			c.HealthCheck.Interval = "30s"
+		}
+		if _, err := time.ParseDuration(c.HealthCheck.Interval); err != nil {
+			return nil, fmt.Errorf("health_check.interval: %w", err)
+		}
+		if c.HealthCheck.Timeout == "" {
+			c.HealthCheck.Timeout = "10s"
+		}
+		if _, err := time.ParseDuration(c.HealthCheck.Timeout); err != nil {
+			return nil, fmt.Errorf("health_check.timeout: %w", err)
+		}
 	}
 	// 展开 ${ENV} 并去空
 	keys := c.Server.APIKeys[:0]

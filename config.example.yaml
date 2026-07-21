@@ -16,6 +16,24 @@ log:
   body_limit: 65536               # 请求/响应体记录上限（字节），超出截断
   log_upstream: true              # 是否记录转发到上游的请求体
 
+# 熔断器（可选，默认关闭）。叠加在 failover.cooldown 之上：
+# 单次失败 → cooldown 短期冷却；连续失败达阈值 → 熔断 OPEN，期间所有请求直接跳过该模型，
+# 冷却到期转 HALF_OPEN 仅放行少量探测请求，探测成功 → CLOSED，探测失败 → 重新 OPEN。
+# 与 failover 的区别：cooldown 是“一次失败后短期避让”，熔断是“连续失败后长期摘除 + 半开探测恢复”。
+breaker:
+  enabled: false                  # 总开关，默认关闭
+  failure_threshold: 5            # 连续失败多少次进入 OPEN
+  open_duration: "60s"            # OPEN 持续时间，到期转 HALF_OPEN
+  half_open_max: 1                # HALF_OPEN 允许的并发探测请求数（通常 1）
+
+# 后台主动健康检查（可选，默认关闭）。启用后周期性对每个上游模型发 max_tokens=1 的最小请求，
+# 探活失败反馈熔断器触发 OPEN，探活成功复位熔断器 CLOSED。
+# 不经过业务调用日志与指标（探活结果也会反馈给熔断器，但不计入业务指标的延迟/成功率）。
+health_check:
+  enabled: false                  # 总开关，默认关闭
+  interval: "30s"                # 探活周期
+  timeout: "10s"                 # 单次探活请求超时
+
 chains:
   # 默认链：gpt -> glm -> claude 三级 fallback
   auto:

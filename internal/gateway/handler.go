@@ -187,14 +187,21 @@ func (h *Handler) runCompletion(c *gin.Context, body []byte, entry *CallEntry) (
 	excluded := map[string]bool{}
 	var lastErr error
 	for switches := 0; ; switches++ {
-		m := h.scheduler.PickNext(chain, excluded)
+		// 动态路由：综合熔断状态/健康/延迟/成功率选最优模型（跳过熔断 OPEN 与冷却中）
+		m := h.scheduler.SelectModel(chain, excluded)
 		if m == nil {
-			msg := "all models exhausted"
+			msg := "all models exhausted (circuit open or cooling down)"
 			if lastErr != nil {
 				msg = lastErr.Error()
 			}
 			writeJSONError(c, http.StatusBadGateway, "upstream_unavailable", msg)
 			return http.StatusBadGateway, lastErr
+		}
+		// 确认放行：触发熔断 OPEN→HALF_OPEN 转换，并发下 double check
+		allowed, _ := h.scheduler.AllowRequest(m)
+		if !allowed {
+			excluded[m.Cfg.Name] = true
+			continue
 		}
 
 		outcome, err := h.tryModel(c, body, m, streamRequested, entry)
@@ -229,6 +236,7 @@ func (h *Handler) tryModel(c *gin.Context, body []byte, m *Model, streamRequeste
 	for attempt := 0; attempt <= m.RetryCount; attempt++ {
 		res, ferr := h.forwarder.Forward(c.Request.Context(), c, body, m, streamRequested)
 		if ferr == nil {
+			h.scheduler.RecordResult(m, msToDur(res.DurationMs), true)
 			h.logger.AddAttempt(entry, AttemptLog{
 				Model: m.Cfg.Name, Priority: m.Cfg.Priority, Upstream: res.UpstreamModel,
 				Status: res.Status, Outcome: "success", Attempt: attempt,
@@ -238,6 +246,8 @@ func (h *Handler) tryModel(c *gin.Context, body []byte, m *Model, streamRequeste
 		}
 		// 响应体已提交（流式中途失败）——无法 fallback，结束本次请求
 		if res != nil && res.BodyCommitted {
+			// 已成功写入部分响应，不计熔断失败
+			h.scheduler.RecordResult(m, msToDur(res.DurationMs), true)
 			h.logger.AddAttempt(entry, AttemptLog{
 				Model: m.Cfg.Name, Priority: m.Cfg.Priority, Upstream: res.UpstreamModel,
 				Status: res.Status, Outcome: "success", Attempt: attempt,
@@ -249,6 +259,7 @@ func (h *Handler) tryModel(c *gin.Context, body []byte, m *Model, streamRequeste
 		ue, _ = ferr.(*UpstreamError)
 		if ue == nil {
 			// 传输错误（DNS/连接拒绝/超时）——切下一优先级
+			h.scheduler.RecordResult(m, msToDur(durationOf(res)), false)
 			h.logger.AddAttempt(entry, AttemptLog{
 				Model: m.Cfg.Name, Priority: m.Cfg.Priority,
 				Status: 0, Outcome: "error", Attempt: attempt,
@@ -258,6 +269,8 @@ func (h *Handler) tryModel(c *gin.Context, body []byte, m *Model, streamRequeste
 		}
 		switch {
 		case m.Retryable[ue.Status] && attempt < m.RetryCount:
+			// 上游故障类状态码：计入熔断失败
+			h.scheduler.RecordResult(m, msToDur(durationOf(res)), false)
 			h.logger.AddAttempt(entry, AttemptLog{
 				Model: m.Cfg.Name, Priority: m.Cfg.Priority,
 				Status: ue.Status, Outcome: "retry", Attempt: attempt,
@@ -266,6 +279,8 @@ func (h *Handler) tryModel(c *gin.Context, body []byte, m *Model, streamRequeste
 			h.sleep(c, m.Backoffs, attempt)
 			continue
 		case m.Failover[ue.Status]:
+			// 触发转移：计入熔断失败
+			h.scheduler.RecordResult(m, msToDur(durationOf(res)), false)
 			h.logger.AddAttempt(entry, AttemptLog{
 				Model: m.Cfg.Name, Priority: m.Cfg.Priority,
 				Status: ue.Status, Outcome: "failover", Attempt: attempt,
@@ -273,7 +288,8 @@ func (h *Handler) tryModel(c *gin.Context, body []byte, m *Model, streamRequeste
 			})
 			return outcomeFailover, ue
 		default:
-			// 非重试/非转移（如 400/404）——原样回给客户端
+			// 非重试/非转移（如 400/404）——上游正常响应只是客户端请求问题，不计熔断失败
+			h.scheduler.RecordResult(m, msToDur(durationOf(res)), true)
 			h.logger.AddAttempt(entry, AttemptLog{
 				Model: m.Cfg.Name, Priority: m.Cfg.Priority,
 				Status: ue.Status, Outcome: "client_error", Attempt: attempt,
@@ -285,6 +301,8 @@ func (h *Handler) tryModel(c *gin.Context, body []byte, m *Model, streamRequeste
 	}
 	// 循环结束：最后一次是 retryable 但不在 failover 触发集中（重试耗尽）——把最后一次错误回给客户端
 	if ue != nil {
+		// 重试耗尽属于上游持续故障，计入熔断失败
+		h.scheduler.RecordResult(m, 0, false)
 		h.logger.AddAttempt(entry, AttemptLog{
 			Model: m.Cfg.Name, Priority: m.Cfg.Priority,
 			Status: ue.Status, Outcome: "client_error", Attempt: m.RetryCount,
@@ -295,6 +313,9 @@ func (h *Handler) tryModel(c *gin.Context, body []byte, m *Model, streamRequeste
 	}
 	return outcomeFailover, nil
 }
+
+// msToDur 把毫秒整数转 time.Duration（用于指标记录）。
+func msToDur(ms int64) time.Duration { return time.Duration(ms) * time.Millisecond }
 
 // durationOf 安全取 ForwardResult.DurationMs（res 可能为 nil）。
 func durationOf(res *ForwardResult) int64 {
@@ -334,7 +355,7 @@ func (h *Handler) Models(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"object": "list", "data": data})
 }
 
-// Health 返回每条链各模型的实时健康（优先级、上游模型、是否冷却中）。
+// Health 返回每条链各模型的实时健康（优先级、上游模型、冷却/熔断状态、延迟、成功率、探活状态）。
 func (h *Handler) Health(c *gin.Context) {
 	names := h.scheduler.ListChains()
 	out := gin.H{}
@@ -342,12 +363,20 @@ func (h *Handler) Health(c *gin.Context) {
 		ch := h.scheduler.GetChain(name)
 		models := make([]gin.H, 0, len(ch.Models))
 		for _, m := range ch.Models {
+			latency, success, total, fail := h.scheduler.Stats(m)
 			models = append(models, gin.H{
-				"name":           m.Cfg.Name,
-				"priority":       m.Cfg.Priority,
-				"upstream_model": m.Cfg.Upstream.Model,
-				"base_url":       m.Cfg.Upstream.BaseURL,
-				"cooling_down":   h.scheduler.IsCoolingDown(m),
+				"name":              m.Cfg.Name,
+				"priority":          m.Cfg.Priority,
+				"upstream_model":    m.Cfg.Upstream.Model,
+				"base_url":          m.Cfg.Upstream.BaseURL,
+				"cooling_down":      h.scheduler.IsCoolingDown(m),
+				"breaker_state":     h.scheduler.BreakerStateName(m),
+				"consecutive_fails": h.scheduler.ConsecutiveFails(m),
+				"health":            h.scheduler.HealthStatus(m).String(),
+				"latency_ema_ms":    latency,
+				"success_rate":      success,
+				"total_requests":    total,
+				"total_failures":   fail,
 			})
 		}
 		out[name] = models

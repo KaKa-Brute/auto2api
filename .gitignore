@@ -21,6 +21,9 @@ vendor/
 go.work
 go.work.sum
 
+# Go 构建缓存
+.gocache/
+
 # IDE / 编辑器
 .idea/
 .vscode/
