@@ -38,7 +38,6 @@ type HealthChecker struct {
 	scheduler *Scheduler
 	interval  time.Duration
 	timeout   time.Duration
-	body      []byte
 	client    *http.Client
 	stopCh    chan struct{}
 	mu        sync.RWMutex
@@ -53,22 +52,37 @@ func NewHealthChecker(s *Scheduler, interval, timeout time.Duration) *HealthChec
 	if timeout <= 0 {
 		timeout = 10 * time.Second
 	}
-	// 最小探活请求体：max_tokens=1、stream=false
-	body, _ := json.Marshal(map[string]any{
-		"model":    "ping",
-		"messages": []map[string]string{{"role": "user", "content": "ping"}},
-		"max_tokens": 1,
-		"stream":    false,
-	})
 	return &HealthChecker{
 		scheduler: s,
 		interval:  interval,
 		timeout:   timeout,
-		body:      body,
 		client:    &http.Client{Timeout: 0}, // 由请求级 context 控制
 		statuses:  map[string]HealthStatus{},
 		stopCh:     make(chan struct{}),
 	}
+}
+
+// probeBody 为指定模型构造最小探活请求体。
+// 关键：用该模型配置的真实上游模型名（m.Cfg.Upstream.Model），
+// 而不是硬编码 "ping"——否则上游校验模型名会回 404/400 被误判为不可用。
+func (h *HealthChecker) probeBody(m *Model) []byte {
+	body, _ := json.Marshal(map[string]any{
+		"model":      m.Cfg.Upstream.Model,
+		"messages":   []map[string]string{{"role": "user", "content": "ping"}},
+		"max_tokens": 1,
+		"stream":     false,
+	})
+	return body
+}
+
+// applyProbeHeaders 注入探针所需的头部，尽量与 Forwarder 对齐，
+// 避免因缺头（如 anthropic-version）被上游 400，导致探针假阴性。
+// Authorization / x-api-key 等鉴权头由 setAuth 注入，这里只补白名单内的业务头。
+func (h *HealthChecker) applyProbeHeaders(req *http.Request, m *Model) {
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("User-Agent", "auto2api-healthcheck")
+	// auth_header 在配置里指定（Authorization / x-api-key / x-goog-api-key / 自定义）
+	setAuth(req, m)
 }
 
 // Start 启动后台 goroutine。
@@ -120,29 +134,62 @@ func (h *HealthChecker) probeAll() {
 	wg.Wait()
 }
 
-// probe 探测单个模型，更新健康状态与熔断器。
+// probe 探测单个模型，按状态码分类更新健康状态与熔断器。
+//   - 2xx：healthy，复位熔断器
+//   - 网络错误 / 5xx：unhealthy，计入熔断失败
+//   - 401/403：unhealthy（鉴权坏），计入熔断失败
+//   - 429：不判 unhealthy（仅限流，模型本身是活的），不计熔断失败
+//   - 400/404：unhealthy（用真实模型名后应消失，若仍出现说明配置有问题）
 func (h *HealthChecker) probe(m *Model) {
 	ctx, cancel := context.WithTimeout(context.Background(), h.timeout)
 	defer cancel()
 	url := buildURL(m.Cfg.Upstream.BaseURL)
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(h.body))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(h.probeBody(m)))
 	if err != nil {
-		h.set(m, false)
+		h.update(m, 0, false)
 		return
 	}
-	req.Header.Set("Content-Type", "application/json")
-	setAuth(req, m)
+	h.applyProbeHeaders(req, m)
 	resp, err := h.client.Do(req)
 	if err != nil {
-		h.set(m, false)
+		// DNS/连接拒绝/超时 → 真死了
+		h.update(m, 0, false)
 		return
 	}
 	_, _ = io.Copy(io.Discard, resp.Body)
 	resp.Body.Close()
-	h.set(m, resp.StatusCode >= 200 && resp.StatusCode < 300)
+	h.update(m, resp.StatusCode, resp.StatusCode >= 200 && resp.StatusCode < 300)
+}
+
+// update 按状态码分类更新健康状态并反馈熔断器。
+// status=0 表示传输错误。healthy 仅在 2xx 时为 true。
+// 429 不触发熔断失败（限流不代表模型坏了），也不记为 unhealthy。
+func (h *HealthChecker) update(m *Model, status int, healthy bool) {
+	key := m.cooldownKey()
+	// 429：限流，模型本身是活的，不计 unhealthy 也不计熔断失败
+	if status == 429 {
+		return
+	}
+	h.mu.Lock()
+	if healthy {
+		h.statuses[key] = HealthHealthy
+	} else {
+		h.statuses[key] = HealthUnhealthy
+	}
+	h.mu.Unlock()
+
+	// 反馈给熔断器：探活结果视为对该模型的一次真实调用观测
+	if b := h.scheduler.breakerOf(key); b != nil {
+		if healthy {
+			b.OnSuccess()
+		} else {
+			b.OnFailure()
+		}
+	}
 }
 
 // set 更新健康状态，并把结果反馈给熔断器（探活成功复位，探活失败触发熔断）。
+// 保留供测试直接设置状态用；生产路径走 update。
 func (h *HealthChecker) set(m *Model, healthy bool) {
 	key := m.cooldownKey()
 	h.mu.Lock()
