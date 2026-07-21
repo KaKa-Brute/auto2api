@@ -62,8 +62,10 @@ func (f *Forwarder) Forward(ctx context.Context, c *gin.Context, body []byte, m 
 	}
 	// 记录转发到上游的请求体（已做模型改写）
 	if f.logger != nil {
-		if e, ok := c.Get("call_entry").(*CallEntry); ok {
-			f.logger.SetUpstreamRequest(e, upBody)
+		if val, exists := c.Get("call_entry"); exists {
+			if e, ok := val.(*CallEntry); ok {
+				f.logger.SetUpstreamRequest(e, upBody)
+			}
 		}
 	}
 	url := buildURL(m.Cfg.Upstream.BaseURL)
@@ -114,11 +116,14 @@ func (f *Forwarder) Forward(ctx context.Context, c *gin.Context, body []byte, m 
 	return res, err
 }
 
-// buildURL 规整 base_url：已含 /chat/completions 则原样，否则追加 /v1/chat/completions。
+// buildURL 规整 base_url：已含 /chat/completions 则原样，否则追加 /chat/completions（如已有 /v1 则只追加 /chat/completions）。
 func buildURL(baseURL string) string {
 	b := strings.TrimRight(baseURL, "/")
 	if strings.HasSuffix(b, "/chat/completions") {
 		return b
+	}
+	if strings.HasSuffix(b, "/v1") {
+		return b + "/chat/completions"
 	}
 	return b + "/v1/chat/completions"
 }
