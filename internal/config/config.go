@@ -15,6 +15,7 @@ import (
 // Config 是整个配置文件的根结构。
 type Config struct {
 	Server ServerConfig            `yaml:"server"`
+	Log    LogConfig               `yaml:"log"`
 	Chains map[string]ChainConfig `yaml:"chains"`
 }
 
@@ -22,6 +23,15 @@ type ServerConfig struct {
 	Addr             string   `yaml:"addr"`
 	MaxModelSwitches int      `yaml:"max_model_switches"`
 	APIKeys          []string `yaml:"api_keys"` // 服务级鉴权 key 列表，为空则不鉴权
+}
+
+// LogConfig 控制调用日志（记录完整调用过程与输入输出，按日期落盘）。
+type LogConfig struct {
+	Enabled      bool   `yaml:"enabled"`        // 总开关，默认 false
+	Dir          string `yaml:"dir"`            // 日志目录，默认 "logs"
+	RedactKeys   bool   `yaml:"redact_keys"`    // 脱敏 Authorization / x-api-key，默认 true
+	BodyLimit    int    `yaml:"body_limit"`     // 请求/响应体记录上限（字节），超出截断，默认 65536
+	LogUpstream  bool   `yaml:"log_upstream"`   // 是否记录转发到上游的请求体，默认 true
 }
 
 // ChainConfig 是一条命名优先级链，外部按链名调用。
@@ -102,6 +112,13 @@ func Load(path string) (*Config, error) {
 	}
 	if c.Server.MaxModelSwitches <= 0 {
 		c.Server.MaxModelSwitches = 5
+	}
+	// 日志默认值
+	if c.Log.Dir == "" {
+		c.Log.Dir = "logs"
+	}
+	if c.Log.BodyLimit <= 0 {
+		c.Log.BodyLimit = 64 * 1024
 	}
 	// 展开 ${ENV} 并去空
 	keys := c.Server.APIKeys[:0]

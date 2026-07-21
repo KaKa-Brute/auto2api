@@ -5,8 +5,10 @@ package gateway
 
 import (
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -18,10 +20,11 @@ type Handler struct {
 	forwarder   *Forwarder
 	maxSwitches int
 	apiKeys     map[string]bool // 已授权 key 集合，为空则不鉴权
+	logger      *CallLogger
 }
 
-func NewHandler(s *Scheduler, f *Forwarder, maxSwitches int, apiKeys []string) *Handler {
-	h := &Handler{scheduler: s, forwarder: f, maxSwitches: maxSwitches}
+func NewHandler(s *Scheduler, f *Forwarder, maxSwitches int, apiKeys []string, logger *CallLogger) *Handler {
+	h := &Handler{scheduler: s, forwarder: f, maxSwitches: maxSwitches, logger: logger}
 	if len(apiKeys) > 0 {
 		h.apiKeys = make(map[string]bool, len(apiKeys))
 		for _, k := range apiKeys {
@@ -33,19 +36,27 @@ func NewHandler(s *Scheduler, f *Forwarder, maxSwitches int, apiKeys []string) *
 	return h
 }
 
-// Register 把路由挂到 gin 引擎上（OpenAI 兼容）。
+// Register 把路由挂到 gin 引擎上（OpenAI 兼容 + Claude 兼容）。
 func (h *Handler) Register(r *gin.Engine) {
 	auth := h.authMiddleware()
+	// OpenAI 兼容端点
 	r.POST("/v1/chat/completions", auth, h.ChatCompletions)
 	r.POST("/chat/completions", auth, h.ChatCompletions) // 无 /v1 前缀的客户端兼容
+	// Claude（Anthropic Messages API）兼容端点
+	r.POST("/v1/messages", auth, h.Messages)
+	r.POST("/messages", auth, h.Messages) // 无 /v1 前缀兼容
 	r.GET("/v1/models", auth, h.Models)
 	r.GET("/v1/health", h.Health) // 健康检查不鉴权，方便监控探活
 }
 
-// authMiddleware 校验客户端 Authorization: Bearer <key>。
-// 未配置 api_keys 时放行（向后兼容）。
+// authMiddleware 校验客户端 Authorization: Bearer <key> / x-api-key。
+// 未配置 api_keys 时放行（向后兼容）。按请求路径推断出站格式，使鉴权错误也按对应格式返回。
 func (h *Handler) authMiddleware() gin.HandlerFunc {
 	return func(c *gin.Context) {
+		// 路径含 /messages 视为 Claude（Anthropic）出站格式
+		if strings.Contains(c.Request.URL.Path, "/messages") {
+			c.Set("outbound_format", "claude")
+		}
 		if len(h.apiKeys) == 0 {
 			c.Next()
 			return
@@ -58,12 +69,7 @@ func (h *Handler) authMiddleware() gin.HandlerFunc {
 			key = c.GetHeader("x-goog-api-key")
 		}
 		if key == "" || !h.apiKeys[key] {
-			c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{
-				"error": gin.H{
-					"message": "invalid or missing API key",
-					"type":    "authentication_error",
-				},
-			})
+			writeJSONError(c, http.StatusUnauthorized, "authentication_error", "invalid or missing API key")
 			return
 		}
 		c.Next()
@@ -91,18 +97,78 @@ const (
 	outcomeClientError                       // 上游返回非重试/非转移状态，已原样回给客户端
 )
 
-// ChatCompletions 处理 POST /v1/chat/completions：按 model 字段选链，按优先级 fallback。
+// ChatCompletions 处理 POST /v1/chat/completions（OpenAI 兼容）：按 model 字段选链，按优先级 fallback。
 func (h *Handler) ChatCompletions(c *gin.Context) {
+	entry := h.logger.Begin(c, "openai")
+	var finalErr error
+	finalStatus := http.StatusOK
+	defer func() {
+		h.logger.End(entry, finalStatus, finalErr)
+	}()
+
 	body, err := io.ReadAll(c.Request.Body)
 	if err != nil {
+		finalStatus = http.StatusBadRequest
+		finalErr = err
 		writeJSONError(c, http.StatusBadRequest, "invalid_request_error", "read body: "+err.Error())
 		return
 	}
 	if !json.Valid(body) {
-		writeJSONError(c, http.StatusBadRequest, "invalid_request_error", "request body is not valid JSON")
+		finalStatus = http.StatusBadRequest
+		finalErr = fmt.Errorf("request body is not valid JSON")
+		writeJSONError(c, http.StatusBadRequest, "invalid_request_error", finalErr.Error())
 		return
 	}
+	finalStatus, finalErr = h.runCompletion(c, body, entry)
+}
 
+// Messages 处理 POST /v1/messages（Anthropic Claude Messages API 兼容）：
+// 把 Claude 请求体转成 OpenAI 格式后走上游，响应再转回 Claude 格式回给客户端。
+func (h *Handler) Messages(c *gin.Context) {
+	// 标记出站格式为 claude，forwarder 与错误写函数据此转换响应
+	c.Set("outbound_format", "claude")
+	entry := h.logger.Begin(c, "claude")
+	var finalErr error
+	finalStatus := http.StatusOK
+	defer func() {
+		h.logger.End(entry, finalStatus, finalErr)
+	}()
+
+	rawBody, err := io.ReadAll(c.Request.Body)
+	if err != nil {
+		finalStatus = http.StatusBadRequest
+		finalErr = err
+		writeJSONError(c, http.StatusBadRequest, "invalid_request_error", "read body: "+err.Error())
+		return
+	}
+	if !json.Valid(rawBody) {
+		finalStatus = http.StatusBadRequest
+		finalErr = fmt.Errorf("request body is not valid JSON")
+		writeJSONError(c, http.StatusBadRequest, "invalid_request_error", finalErr.Error())
+		return
+	}
+	// Claude → OpenAI 请求转换（system 折成 system 消息、内容块/工具映射）
+	openaiBody, _, cerr := claudeRequestToOpenAI(rawBody)
+	if cerr != nil {
+		finalStatus = http.StatusBadRequest
+		finalErr = cerr
+		writeJSONError(c, http.StatusBadRequest, "invalid_request_error", "convert claude request: "+cerr.Error())
+		return
+	}
+	// 记录原始 Claude 请求体（转换前）；上游请求体由 forwarder 记录
+	chainName := extractString(openaiBody, "model")
+	if chainName == "" {
+		chainName = "auto"
+	}
+	streamRequested := extractBool(openaiBody, "stream")
+	h.logger.SetRequest(entry, rawBody, chainName, streamRequested)
+
+	finalStatus, finalErr = h.runCompletion(c, openaiBody, entry)
+}
+
+// runCompletion 按 model 字段选链并执行两级 fallback 编排（层1同模型退避重试 + 层2跨优先级故障转移）。
+// 返回最终响应状态码与编排级错误（若有）。body 须为合法 OpenAI Chat 请求 JSON。
+func (h *Handler) runCompletion(c *gin.Context, body []byte, entry *CallEntry) (int, error) {
 	chainName := extractString(body, "model")
 	if chainName == "" {
 		chainName = "auto"
@@ -110,9 +176,13 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 	chain := h.scheduler.GetChain(chainName)
 	if chain == nil {
 		writeJSONError(c, http.StatusNotFound, "invalid_request_error", "unknown model/chain: "+chainName)
-		return
+		return http.StatusNotFound, fmt.Errorf("unknown chain: %s", chainName)
 	}
 	streamRequested := extractBool(body, "stream")
+	// ChatCompletions 路径在此记录请求；Messages 路径已提前记录（原始 Claude body）
+	if entry != nil && entry.Format == "openai" {
+		h.logger.SetRequest(entry, body, chainName, streamRequested)
+	}
 
 	excluded := map[string]bool{}
 	var lastErr error
@@ -124,16 +194,16 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 				msg = lastErr.Error()
 			}
 			writeJSONError(c, http.StatusBadGateway, "upstream_unavailable", msg)
-			return
+			return http.StatusBadGateway, lastErr
 		}
 
-		outcome, err := h.tryModel(c, body, m, streamRequested)
+		outcome, err := h.tryModel(c, body, m, streamRequested, entry)
 		if err != nil {
 			lastErr = err
 		}
 		switch outcome {
 		case outcomeSuccess, outcomeClientError:
-			return
+			return c.Writer.Status(), err
 		case outcomeFailover:
 			// 层 2：跨优先级模型故障转移
 			h.scheduler.MarkCooldown(m)
@@ -144,7 +214,7 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 					msg = lastErr.Error()
 				}
 				writeJSONError(c, http.StatusBadGateway, "upstream_unavailable", msg)
-				return
+				return http.StatusBadGateway, lastErr
 			}
 		}
 	}
@@ -154,40 +224,84 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 // 状态码处理顺序：retryable 且仍有重试次数 → 退避重试；否则 failover 触发 → 转移；
 // 否则视为客户端错误原样返回。这样 429（retryable+failover）会先重试、耗尽后再转移，
 // 401/403/500（仅 failover）则立即转移。
-func (h *Handler) tryModel(c *gin.Context, body []byte, m *Model, streamRequested bool) (attemptOutcome, error) {
+func (h *Handler) tryModel(c *gin.Context, body []byte, m *Model, streamRequested bool, entry *CallEntry) (attemptOutcome, error) {
 	var ue *UpstreamError
 	for attempt := 0; attempt <= m.RetryCount; attempt++ {
 		res, ferr := h.forwarder.Forward(c.Request.Context(), c, body, m, streamRequested)
 		if ferr == nil {
+			h.logger.AddAttempt(entry, AttemptLog{
+				Model: m.Cfg.Name, Priority: m.Cfg.Priority, Upstream: res.UpstreamModel,
+				Status: res.Status, Outcome: "success", Attempt: attempt,
+				DurationMs: res.DurationMs, FirstTokenMs: res.FirstTokenMs,
+			})
 			return outcomeSuccess, nil
 		}
 		// 响应体已提交（流式中途失败）——无法 fallback，结束本次请求
 		if res != nil && res.BodyCommitted {
+			h.logger.AddAttempt(entry, AttemptLog{
+				Model: m.Cfg.Name, Priority: m.Cfg.Priority, Upstream: res.UpstreamModel,
+				Status: res.Status, Outcome: "success", Attempt: attempt,
+				DurationMs: res.DurationMs, FirstTokenMs: res.FirstTokenMs,
+				Error: "body committed, abort fallback",
+			})
 			return outcomeSuccess, nil
 		}
 		ue, _ = ferr.(*UpstreamError)
 		if ue == nil {
 			// 传输错误（DNS/连接拒绝/超时）——切下一优先级
+			h.logger.AddAttempt(entry, AttemptLog{
+				Model: m.Cfg.Name, Priority: m.Cfg.Priority,
+				Status: 0, Outcome: "error", Attempt: attempt,
+				DurationMs: durationOf(res), Error: ferr.Error(),
+			})
 			return outcomeFailover, ferr
 		}
 		switch {
 		case m.Retryable[ue.Status] && attempt < m.RetryCount:
+			h.logger.AddAttempt(entry, AttemptLog{
+				Model: m.Cfg.Name, Priority: m.Cfg.Priority,
+				Status: ue.Status, Outcome: "retry", Attempt: attempt,
+				DurationMs: durationOf(res), Error: ue.Error(),
+			})
 			h.sleep(c, m.Backoffs, attempt)
 			continue
 		case m.Failover[ue.Status]:
+			h.logger.AddAttempt(entry, AttemptLog{
+				Model: m.Cfg.Name, Priority: m.Cfg.Priority,
+				Status: ue.Status, Outcome: "failover", Attempt: attempt,
+				DurationMs: durationOf(res), Error: ue.Error(),
+			})
 			return outcomeFailover, ue
 		default:
 			// 非重试/非转移（如 400/404）——原样回给客户端
+			h.logger.AddAttempt(entry, AttemptLog{
+				Model: m.Cfg.Name, Priority: m.Cfg.Priority,
+				Status: ue.Status, Outcome: "client_error", Attempt: attempt,
+				DurationMs: durationOf(res), Error: ue.Error(),
+			})
 			writeUpstreamError(c, ue)
 			return outcomeClientError, ue
 		}
 	}
 	// 循环结束：最后一次是 retryable 但不在 failover 触发集中（重试耗尽）——把最后一次错误回给客户端
 	if ue != nil {
+		h.logger.AddAttempt(entry, AttemptLog{
+			Model: m.Cfg.Name, Priority: m.Cfg.Priority,
+			Status: ue.Status, Outcome: "client_error", Attempt: m.RetryCount,
+			DurationMs: durationOf(nil), Error: ue.Error(),
+		})
 		writeUpstreamError(c, ue)
 		return outcomeClientError, ue
 	}
 	return outcomeFailover, nil
+}
+
+// durationOf 安全取 ForwardResult.DurationMs（res 可能为 nil）。
+func durationOf(res *ForwardResult) int64 {
+	if res == nil {
+		return 0
+	}
+	return res.DurationMs
 }
 
 // sleep 在退避时睡指定时长，客户端断开则提前返回。
@@ -276,13 +390,29 @@ func extractBool(body []byte, key string) bool {
 }
 
 func writeJSONError(c *gin.Context, status int, etype, msg string) {
+	// Claude（Anthropic）错误格式：{"type":"error","error":{"type":...,"message":...}}
+	if c.GetString("outbound_format") == "claude" {
+		c.JSON(status, gin.H{
+			"type":  "error",
+			"error": gin.H{"type": etype, "message": msg},
+		})
+		return
+	}
 	c.JSON(status, gin.H{"error": gin.H{"message": msg, "type": etype}})
 }
 
 func writeUpstreamError(c *gin.Context, e *UpstreamError) {
 	body := e.Body
 	if body == "" || !json.Valid([]byte(body)) {
-		b, _ := json.Marshal(gin.H{"error": gin.H{"message": e.Error(), "type": "upstream_error"}})
+		var b []byte
+		if c.GetString("outbound_format") == "claude" {
+			b, _ = json.Marshal(gin.H{
+				"type":  "error",
+				"error": gin.H{"type": "upstream_error", "message": e.Error()},
+			})
+		} else {
+			b, _ = json.Marshal(gin.H{"error": gin.H{"message": e.Error(), "type": "upstream_error"}})
+		}
 		body = string(b)
 	}
 	c.Data(e.Status, "application/json", []byte(body))

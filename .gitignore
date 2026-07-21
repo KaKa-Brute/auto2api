@@ -13,6 +13,9 @@ auto2api
 *.test
 *.out
 
+# 调用日志（按日期落盘，含输入输出，勿入库）
+logs/
+
 # Go 工作区
 vendor/
 go.work

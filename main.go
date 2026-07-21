@@ -23,12 +23,13 @@ func main() {
 	if err != nil {
 		log.Fatalf("init scheduler: %v", err)
 	}
-	fwd := gateway.NewForwarder()
-	h := gateway.NewHandler(sched, fwd, cfg.Server.MaxModelSwitches, cfg.Server.APIKeys)
+	logger := gateway.NewCallLogger(cfg.Log.Dir, cfg.Log.Enabled, cfg.Log.RedactKeys, cfg.Log.LogUpstream, cfg.Log.BodyLimit)
+	fwd := gateway.NewForwarder(logger)
+	h := gateway.NewHandler(sched, fwd, cfg.Server.MaxModelSwitches, cfg.Server.APIKeys, logger)
 
 	r := gin.Default()
 	h.Register(r)
-	log.Printf("auto2api listening on %s, chains: %v", cfg.Server.Addr, sched.ListChains())
+	log.Printf("auto2api listening on %s, chains: %v, call_log: %v", cfg.Server.Addr, sched.ListChains(), logger.Enabled())
 	if err := r.Run(cfg.Server.Addr); err != nil {
 		log.Fatalf("server: %v", err)
 	}

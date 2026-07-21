@@ -8,6 +8,14 @@ server:
     - "sk-auto2api-CHANGE_ME"     # 可配多个方便轮换；支持 ${ENV} 展开
     # - "${AUTO2API_KEY2}"
 
+# 调用日志：记录完整调用过程与输入输出，按日期落盘（logs/calls-YYYY-MM-DD.log）
+log:
+  enabled: false                  # 总开关，默认关闭
+  dir: "logs"                     # 日志目录（按日期轮转）
+  redact_keys: true               # 脱敏 Authorization / x-api-key，避免凭据泄露
+  body_limit: 65536               # 请求/响应体记录上限（字节），超出截断
+  log_upstream: true              # 是否记录转发到上游的请求体
+
 chains:
   # 默认链：gpt -> glm -> claude 三级 fallback
   auto:

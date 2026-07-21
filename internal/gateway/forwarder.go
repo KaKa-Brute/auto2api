@@ -30,10 +30,11 @@ func (e *UpstreamError) Error() string {
 // Forwarder 持有共享的 *http.Client（流式安全：Timeout=0，由请求级 context 控制截止）。
 type Forwarder struct {
 	client *http.Client
+	logger *CallLogger
 }
 
-func NewForwarder() *Forwarder {
-	return &Forwarder{client: &http.Client{Timeout: 0}}
+func NewForwarder(logger *CallLogger) *Forwarder {
+	return &Forwarder{client: &http.Client{Timeout: 0}, logger: logger}
 }
 
 // allowedHeaders 是从客户端透传到上游的头部白名单（小写），其余一律丢弃。
@@ -58,6 +59,12 @@ func (f *Forwarder) Forward(ctx context.Context, c *gin.Context, body []byte, m 
 	upBody, err := rewriteModel(body, m.Cfg.Upstream.Model)
 	if err != nil {
 		return &ForwardResult{}, fmt.Errorf("rewrite model: %w", err)
+	}
+	// 记录转发到上游的请求体（已做模型改写）
+	if f.logger != nil {
+		if e, ok := c.Get("call_entry").(*CallEntry); ok {
+			f.logger.SetUpstreamRequest(e, upBody)
+		}
 	}
 	url := buildURL(m.Cfg.Upstream.BaseURL)
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(upBody))
@@ -91,9 +98,15 @@ func (f *Forwarder) Forward(ctx context.Context, c *gin.Context, body []byte, m 
 
 	res := &ForwardResult{Status: resp.StatusCode, UpstreamModel: m.Cfg.Upstream.Model, Stream: streamRequested}
 	begin := time.Now()
-	if streamRequested {
+	format := c.GetString("outbound_format")
+	switch {
+	case streamRequested && format == "claude":
+		res.FirstTokenMs, err = pipeSSEClaude(ctx, c, resp, m, begin)
+	case streamRequested:
 		res.FirstTokenMs, err = f.pipeSSE(ctx, c, resp, m, begin)
-	} else {
+	case format == "claude":
+		err = f.pipeNonStreamClaude(c, resp, m)
+	default:
 		err = f.pipeNonStream(c, resp)
 	}
 	res.BodyCommitted = true
@@ -220,6 +233,27 @@ func (f *Forwarder) pipeNonStream(c *gin.Context, resp *http.Response) error {
 	}
 	w.WriteHeader(resp.StatusCode)
 	_, err := io.Copy(w, resp.Body)
+	return err
+}
+
+// pipeNonStreamClaude 读上游 OpenAI 非流式响应，转成 Claude message JSON 后写回客户端。
+func (f *Forwarder) pipeNonStreamClaude(c *gin.Context, resp *http.Response, m *Model) error {
+	defer resp.Body.Close()
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 32*1024*1024))
+	if err != nil {
+		return err
+	}
+	out, err := openaiResponseToClaude(body, m.Cfg.Upstream.Model)
+	if err != nil {
+		// 转换失败：原样回退，避免完全无响应
+		c.Writer.Header().Set("Content-Type", "application/json")
+		c.Writer.WriteHeader(resp.StatusCode)
+		_, _ = c.Writer.Write(body)
+		return err
+	}
+	c.Writer.Header().Set("Content-Type", "application/json")
+	c.Writer.WriteHeader(http.StatusOK)
+	_, err = c.Writer.Write(out)
 	return err
 }
 
