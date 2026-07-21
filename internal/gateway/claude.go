@@ -488,12 +488,16 @@ func extractOpenAIUsage(u interface{}) (in, out int) {
 type claudeStreamState struct {
 	messageStartSent bool
 	textBlockOpen    bool
-	toolBlockIndexes map[string]int
-	nextBlockIndex   int
-	model            string
-	messageID        string
-	outputTokens     int
-	inputTokens      int
+	toolBlockIndexes map[string]int // OpenAI tool_call id（或 name fallback）→ Claude block index
+	// toolBlockByOpenAIIndex 是 OpenAI tool_calls[].index → Claude block index 映射。
+	// 用于后续 arguments 增量 chunks（只有 index、无 id/name）时定位已注册的 block，
+	// 否则 arguments 增量会被丢弃，导致客户端最终拼出的 input 为空 {}。
+	toolBlockByOpenAIIndex map[int]int
+	nextBlockIndex         int
+	model                  string
+	messageID              string
+	outputTokens           int
+	inputTokens            int
 }
 
 // pipeSSEClaude 读上游 OpenAI SSE，逐块转成 Claude SSE 事件写给客户端。
@@ -512,10 +516,11 @@ func pipeSSEClaude(ctx context.Context, c *gin.Context, resp *http.Response, m *
 	flusher.Flush()
 
 	st := &claudeStreamState{
-		model:            m.Cfg.Upstream.Model,
-		messageID:        "msg_" + newRandID(),
-		toolBlockIndexes: map[string]int{},
-		nextBlockIndex:   1,
+		model:                  m.Cfg.Upstream.Model,
+		messageID:              "msg_" + newRandID(),
+		toolBlockIndexes:       map[string]int{},
+		toolBlockByOpenAIIndex: map[int]int{},
+		nextBlockIndex:         1,
 	}
 
 	lines := make(chan string, 16)
@@ -696,7 +701,14 @@ func (st *claudeStreamState) ensureToolBlock(writeEvent func(string, interface{}
 	if id == "" {
 		id = nestedString(tc, "function", "name")
 	}
+	// 无 id 也无 name：用 OpenAI tool_calls[].index 定位已注册的 block
+	// （后续 arguments 增量 chunks 标准格式只带 index + function.arguments）
 	if id == "" {
+		if openAIIdx := toolIndexOf(tc); openAIIdx >= 0 {
+			if idx, ok := st.toolBlockByOpenAIIndex[openAIIdx]; ok {
+				return idx
+			}
+		}
 		return -1
 	}
 	if idx, ok := st.toolBlockIndexes[id]; ok {
@@ -723,6 +735,10 @@ func (st *claudeStreamState) ensureToolBlock(writeEvent func(string, interface{}
 		},
 	})
 	st.toolBlockIndexes[id] = idx
+	// 同时记录 openAI index → block index，供后续无 id 的 arguments 增量 chunks 关联
+	if openAIIdx := toolIndexOf(tc); openAIIdx >= 0 {
+		st.toolBlockByOpenAIIndex[openAIIdx] = idx
+	}
 	return idx
 }
 
