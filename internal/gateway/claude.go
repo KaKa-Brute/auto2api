@@ -13,6 +13,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"sort"
 	"strings"
 	"time"
 
@@ -486,7 +487,9 @@ func extractOpenAIUsage(u interface{}) (in, out int) {
 // claudeStreamState 维护 OpenAI→Claude 流式转换的跨事件状态。
 type claudeStreamState struct {
 	messageStartSent bool
-	blockStartSent   bool
+	textBlockOpen    bool
+	toolBlockIndexes map[string]int
+	nextBlockIndex   int
 	model            string
 	messageID        string
 	outputTokens     int
@@ -509,8 +512,10 @@ func pipeSSEClaude(ctx context.Context, c *gin.Context, resp *http.Response, m *
 	flusher.Flush()
 
 	st := &claudeStreamState{
-		model:     m.Cfg.Upstream.Model,
-		messageID: "msg_" + newRandID(),
+		model:            m.Cfg.Upstream.Model,
+		messageID:        "msg_" + newRandID(),
+		toolBlockIndexes: map[string]int{},
+		nextBlockIndex:   1,
 	}
 
 	lines := make(chan string, 16)
@@ -632,7 +637,7 @@ func (st *claudeStreamState) handleChunk(w io.Writer, chunk map[string]interface
 			"index":         0,
 			"content_block": map[string]interface{}{"type": "text", "text": ""},
 		})
-		st.blockStartSent = true
+		st.textBlockOpen = true
 	}
 
 	// 文本增量
@@ -645,40 +650,27 @@ func (st *claudeStreamState) handleChunk(w io.Writer, chunk map[string]interface
 		st.outputTokens++
 	}
 
-	// 工具调用增量（简化：整包发 tool_use 块）
+	// 工具调用增量：支持标准 OpenAI 增量（index/id/function.name/function.arguments 分片）
 	if tcs, ok := delta["tool_calls"].([]interface{}); ok {
 		for _, raw := range tcs {
 			tc, ok := raw.(map[string]interface{})
 			if !ok {
 				continue
 			}
-			fn, _ := tc["function"].(map[string]interface{})
-			name, _ := fn["name"].(string)
-			args, _ := fn["arguments"].(string)
-			var input interface{}
-			_ = json.Unmarshal([]byte(args), &input)
-			writeEvent("content_block_start", map[string]interface{}{
-				"type":  "content_block_start",
-				"index": 1,
-				"content_block": map[string]interface{}{
-					"type":  "tool_use",
-					"id":    tc["id"],
-					"name":  name,
-					"input": map[string]interface{}{},
-				},
-			})
-			writeEvent("content_block_delta", map[string]interface{}{
-				"type":  "content_block_delta",
-				"index": 1,
-				"delta": map[string]interface{}{
-					"type":         "input_json_delta",
-					"partial_json": args,
-				},
-			})
-			writeEvent("content_block_stop", map[string]interface{}{
-				"type":  "content_block_stop",
-				"index": 1,
-			})
+			blockIndex := st.ensureToolBlock(writeEvent, tc)
+			if blockIndex < 0 {
+				continue
+			}
+			if partial := extractToolArgumentsDelta(tc); partial != "" {
+				writeEvent("content_block_delta", map[string]interface{}{
+					"type":  "content_block_delta",
+					"index": blockIndex,
+					"delta": map[string]interface{}{
+						"type":         "input_json_delta",
+						"partial_json": partial,
+					},
+				})
+			}
 		}
 	}
 
@@ -688,19 +680,114 @@ func (st *claudeStreamState) handleChunk(w io.Writer, chunk map[string]interface
 		if u, ok := chunk["usage"].(map[string]interface{}); ok {
 			st.collectUsage(u)
 		}
-		writeEvent("content_block_stop", map[string]interface{}{
-			"type":  "content_block_stop",
-			"index": 0,
-		})
+		st.closeOpenBlocks(writeEvent)
 		writeEvent("message_delta", map[string]interface{}{
 			"type":  "message_delta",
 			"delta": map[string]interface{}{"stop_reason": stop, "stop_sequence": nil},
 			"usage": map[string]interface{}{"output_tokens": st.outputTokens},
 		})
-		st.blockStartSent = false
 	}
 	flush()
 	return true
+}
+
+func (st *claudeStreamState) ensureToolBlock(writeEvent func(string, interface{}), tc map[string]interface{}) int {
+	id, _ := tc["id"].(string)
+	if id == "" {
+		id = nestedString(tc, "function", "name")
+	}
+	if id == "" {
+		return -1
+	}
+	if idx, ok := st.toolBlockIndexes[id]; ok {
+		return idx
+	}
+	idx := toolIndexOf(tc)
+	if idx < 0 {
+		idx = st.nextBlockIndex
+	} else {
+		idx++
+	}
+	if idx >= st.nextBlockIndex {
+		st.nextBlockIndex = idx + 1
+	}
+	name := nestedString(tc, "function", "name")
+	writeEvent("content_block_start", map[string]interface{}{
+		"type":  "content_block_start",
+		"index": idx,
+		"content_block": map[string]interface{}{
+			"type":  "tool_use",
+			"id":    id,
+			"name":  name,
+			"input": map[string]interface{}{},
+		},
+	})
+	st.toolBlockIndexes[id] = idx
+	return idx
+}
+
+func extractToolArgumentsDelta(tc map[string]interface{}) string {
+	if fn, ok := tc["function"].(map[string]interface{}); ok {
+		if args, ok := fn["arguments"].(string); ok {
+			return args
+		}
+	}
+	return ""
+}
+
+func toolIndexOf(tc map[string]interface{}) int {
+	switch v := tc["index"].(type) {
+	case float64:
+		return int(v)
+	case int:
+		return v
+	case int64:
+		return int(v)
+	default:
+		return -1
+	}
+}
+
+func nestedString(m map[string]interface{}, keys ...string) string {
+	var cur interface{} = m
+	for _, k := range keys {
+		next, ok := cur.(map[string]interface{})
+		if !ok {
+			return ""
+		}
+		cur = next[k]
+	}
+	s, _ := cur.(string)
+	return s
+}
+
+func (st *claudeStreamState) closeOpenBlocks(writeEvent func(string, interface{})) {
+	if st.textBlockOpen {
+		writeEvent("content_block_stop", map[string]interface{}{
+			"type":  "content_block_stop",
+			"index": 0,
+		})
+		st.textBlockOpen = false
+	}
+	if len(st.toolBlockIndexes) == 0 {
+		return
+	}
+	indexes := make([]int, 0, len(st.toolBlockIndexes))
+	seen := map[int]bool{}
+	for _, idx := range st.toolBlockIndexes {
+		if !seen[idx] {
+			seen[idx] = true
+			indexes = append(indexes, idx)
+		}
+	}
+	sort.Ints(indexes)
+	for _, idx := range indexes {
+		writeEvent("content_block_stop", map[string]interface{}{
+			"type":  "content_block_stop",
+			"index": idx,
+		})
+	}
+	st.toolBlockIndexes = map[string]int{}
 }
 
 func (st *claudeStreamState) collectUsage(u map[string]interface{}) {
@@ -714,9 +801,10 @@ func (st *claudeStreamState) collectUsage(u map[string]interface{}) {
 
 // finishStream 在上游结束但未显式发 finish_reason 时补完 Claude 终止序列。
 func (st *claudeStreamState) finishStream(w io.Writer, flush func()) {
-	if st.blockStartSent {
-		fmt.Fprintf(w, "event: content_block_stop\ndata: %s\n\n", `{"type":"content_block_stop","index":0}`)
-	}
+	st.closeOpenBlocks(func(eventName string, data interface{}) {
+		b, _ := json.Marshal(data)
+		fmt.Fprintf(w, "event: %s\ndata: %s\n\n", eventName, string(b))
+	})
 	fmt.Fprintf(w, "event: message_delta\ndata: %s\n\n", fmt.Sprintf(
 		`{"type":"message_delta","delta":{"stop_reason":"end_turn","stop_sequence":null},"usage":{"output_tokens":%d}}`,
 		st.outputTokens,

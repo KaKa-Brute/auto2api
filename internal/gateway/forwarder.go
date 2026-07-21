@@ -40,10 +40,16 @@ func NewForwarder(logger *CallLogger) *Forwarder {
 // allowedHeaders 是从客户端透传到上游的头部白名单（小写），其余一律丢弃。
 // 刻意剥离 authorization / x-api-key / cookie 等，避免泄露客户端凭据。
 var allowedHeaders = map[string]bool{
-	"accept":          true,
-	"user-agent":      true,
-	"accept-language": true,
-	"accept-encoding": true,
+	"accept":                true,
+	"accept-language":       true,
+	"accept-encoding":       true,
+	"user-agent":            true,
+	"openai-organization":   true,
+	"openai-project":        true,
+	"anthropic-version":     true,
+	"anthropic-beta":        true,
+	"x-request-id":          true,
+	"idempotency-key":       true,
 }
 
 // Forward 把请求体转发到指定上游模型。
@@ -229,13 +235,11 @@ func (f *Forwarder) pipeSSE(ctx context.Context, c *gin.Context, resp *http.Resp
 	}
 }
 
-// pipeNonStream 透传非流式响应（2xx），原样写状态码、Content-Type 与 body。
+// pipeNonStream 透传非流式响应（2xx），尽量保留上游状态码与关键响应头。
 func (f *Forwarder) pipeNonStream(c *gin.Context, resp *http.Response) error {
 	defer resp.Body.Close()
 	w := c.Writer
-	if ct := resp.Header.Get("Content-Type"); ct != "" {
-		w.Header().Set("Content-Type", ct)
-	}
+	copyResponseHeaders(w.Header(), resp.Header)
 	w.WriteHeader(resp.StatusCode)
 	_, err := io.Copy(w, resp.Body)
 	return err
@@ -251,7 +255,7 @@ func (f *Forwarder) pipeNonStreamClaude(c *gin.Context, resp *http.Response, m *
 	out, err := openaiResponseToClaude(body, m.Cfg.Upstream.Model)
 	if err != nil {
 		// 转换失败：原样回退，避免完全无响应
-		c.Writer.Header().Set("Content-Type", "application/json")
+		copyResponseHeaders(c.Writer.Header(), resp.Header)
 		c.Writer.WriteHeader(resp.StatusCode)
 		_, _ = c.Writer.Write(body)
 		return err
@@ -260,6 +264,18 @@ func (f *Forwarder) pipeNonStreamClaude(c *gin.Context, resp *http.Response, m *
 	c.Writer.WriteHeader(http.StatusOK)
 	_, err = c.Writer.Write(out)
 	return err
+}
+
+func copyResponseHeaders(dst, src http.Header) {
+	for k, vals := range src {
+		lk := strings.ToLower(k)
+		if lk == "content-length" || lk == "transfer-encoding" || lk == "connection" {
+			continue
+		}
+		for _, v := range vals {
+			dst.Add(k, v)
+		}
+	}
 }
 
 func ms(d time.Duration) int64 { return d.Milliseconds() }
