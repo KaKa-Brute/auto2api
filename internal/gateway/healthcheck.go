@@ -8,7 +8,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
-	"io"
+	"log"
 	"net/http"
 	"sync"
 	"time"
@@ -62,15 +62,15 @@ func NewHealthChecker(s *Scheduler, interval, timeout time.Duration) *HealthChec
 	}
 }
 
-// probeBody 为指定模型构造最小探活请求体。
+// probeBody 为指定模型构造轻量探活请求体。
+// 只发 model + 空 messages，不带 max_tokens——上游校验 messages 为空会快速返回 400，
+// 不需要等模型生成 token。这样能避免某些模型（如 Claude）对 max_tokens=1 响应极慢导致探针超时。
 // 关键：用该模型配置的真实上游模型名（m.Cfg.Upstream.Model），
 // 而不是硬编码 "ping"——否则上游校验模型名会回 404/400 被误判为不可用。
 func (h *HealthChecker) probeBody(m *Model) []byte {
 	body, _ := json.Marshal(map[string]any{
-		"model":      m.Cfg.Upstream.Model,
-		"messages":   []map[string]string{{"role": "user", "content": "ping"}},
-		"max_tokens": 1,
-		"stream":     false,
+		"model":    m.Cfg.Upstream.Model,
+		"messages": []map[string]string{},
 	})
 	return body
 }
@@ -134,36 +134,53 @@ func (h *HealthChecker) probeAll() {
 	wg.Wait()
 }
 
-// probe 探测单个模型，按状态码分类更新健康状态与熔断器。
-//   - 2xx：healthy，复位熔断器
-//   - 网络错误 / 5xx：unhealthy，计入熔断失败
-//   - 401/403：unhealthy（鉴权坏），计入熔断失败
-//   - 429：不判 unhealthy（仅限流，模型本身是活的），不计熔断失败
-//   - 400/404：unhealthy（用真实模型名后应消失，若仍出现说明配置有问题）
+// probe 轻量探测单个模型，只检查上游端点是否可达，不等待模型生成响应。
+//   - 发送空 messages 请求，上游校验失败会快速返回错误（不用等模型生成 token）
+//   - 收到 HTTP 响应（非 5xx）→ 端点可达（healthy）
+//   - 5xx → 上游服务故障（unhealthy）
+//   - 网络错误/超时 → 端点不可达（unhealthy）
+//   - 429 → 忽略（限流不代表不可达）
+//   - 超时：复用模型配置的 timeout（如 120s）而非固定 health_check.timeout，
+//     避免代理延迟导致 10s 超时假阴性。
 func (h *HealthChecker) probe(m *Model) {
-	ctx, cancel := context.WithTimeout(context.Background(), h.timeout)
+	ctx, cancel := context.WithTimeout(context.Background(), m.Timeout)
 	defer cancel()
 	url := buildURL(m.Cfg.Upstream.BaseURL)
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(h.probeBody(m)))
 	if err != nil {
+		log.Printf("[healthcheck] %s: build request failed: %v", m.cooldownKey(), err)
 		h.update(m, 0, false)
 		return
 	}
 	h.applyProbeHeaders(req, m)
+	start := time.Now()
 	resp, err := h.client.Do(req)
 	if err != nil {
-		// DNS/连接拒绝/超时 → 真死了
+		// DNS/连接拒绝/超时 → 端点不可达
+		log.Printf("[healthcheck] %s: probe failed (status=0, dur=%s): %v", m.cooldownKey(), time.Since(start), err)
 		h.update(m, 0, false)
 		return
 	}
-	_, _ = io.Copy(io.Discard, resp.Body)
+	// 轻量探测：只看状态码，不读响应体（避免等待模型生成 token）
 	resp.Body.Close()
-	h.update(m, resp.StatusCode, resp.StatusCode >= 200 && resp.StatusCode < 300)
+	elapsed := time.Since(start)
+	// 收到 HTTP 响应即认为端点可达（4xx/5xx 都说明 HTTP 服务活着）。
+	// 真正的服务状态由真实业务请求（RecordResult）反馈给熔断器。
+	healthy := resp.StatusCode != 429
+	if !healthy {
+		log.Printf("[healthcheck] %s: probe unhealthy (status=%d, dur=%s)", m.cooldownKey(), resp.StatusCode, elapsed)
+	}
+	h.update(m, resp.StatusCode, healthy)
 }
 
 // update 按状态码分类更新健康状态并反馈熔断器。
-// status=0 表示传输错误。healthy 仅在 2xx 时为 true。
+// status=0 表示传输错误。healthy=true 表示端点可达（非 5xx）。
 // 429 不触发熔断失败（限流不代表模型坏了），也不记为 unhealthy。
+//
+// 探针失败不调用 breaker.OnFailure()——探针可能因网络抖动等瞬时原因失败，
+// 不应直接驱动熔断器 OPEN 或在 HALF_OPEN 下重置 openedAt 导致无限循环。
+// 熔断器的失败计数只由真实业务请求（RecordResult）驱动。
+// 探针成功仍调 OnSuccess() 帮助恢复（HALF_OPEN→CLOSED）。
 func (h *HealthChecker) update(m *Model, status int, healthy bool) {
 	key := m.cooldownKey()
 	// 429：限流，模型本身是活的，不计 unhealthy 也不计熔断失败
@@ -178,17 +195,17 @@ func (h *HealthChecker) update(m *Model, status int, healthy bool) {
 	}
 	h.mu.Unlock()
 
-	// 反馈给熔断器：探活结果视为对该模型的一次真实调用观测
-	if b := h.scheduler.breakerOf(key); b != nil {
-		if healthy {
+	// 探针成功时反馈给熔断器帮助恢复（HALF_OPEN→CLOSED，CLOSED 清零连续失败）。
+	// 探针失败只更新 HealthStatus（供路由降级），不驱动熔断器状态转换。
+	if healthy {
+		if b := h.scheduler.breakerOf(key); b != nil {
 			b.OnSuccess()
-		} else {
-			b.OnFailure()
 		}
 	}
 }
 
-// set 更新健康状态，并把结果反馈给熔断器（探活成功复位，探活失败触发熔断）。
+// set 更新健康状态，探活成功时反馈给熔断器帮助恢复。
+// 探活失败只更新 HealthStatus，不驱动熔断器（熔断由真实请求驱动）。
 // 保留供测试直接设置状态用；生产路径走 update。
 func (h *HealthChecker) set(m *Model, healthy bool) {
 	key := m.cooldownKey()
@@ -200,12 +217,10 @@ func (h *HealthChecker) set(m *Model, healthy bool) {
 	}
 	h.mu.Unlock()
 
-	// 反馈给熔断器：探活结果视为对该模型的一次真实调用观测
-	if b := h.scheduler.breakerOf(key); b != nil {
-		if healthy {
+	// 探针成功时反馈给熔断器帮助恢复；探针失败不驱动熔断器状态转换。
+	if healthy {
+		if b := h.scheduler.breakerOf(key); b != nil {
 			b.OnSuccess()
-		} else {
-			b.OnFailure()
 		}
 	}
 }

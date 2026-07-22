@@ -90,9 +90,10 @@ func TestHealthCheck429DoesNotTripBreaker(t *testing.T) {
 	}
 }
 
-// TestHealthCheck5xxTripsBreaker 验证 5xx 仍正常计入熔断失败，
-// 确保状态码细分没有把真正的上游故障也放行。
-func TestHealthCheck5xxTripsBreaker(t *testing.T) {
+// TestHealthCheckProbeFailureDoesNotTripBreaker 验证探针失败（连接不可达）不直接驱动熔断器 OPEN。
+// 探针失败只更新 HealthStatus 为 unhealthy 供路由降级；
+// 熔断器的失败计数由真实业务请求（RecordResult）驱动。
+func TestHealthCheckProbeFailureDoesNotTripBreaker(t *testing.T) {
 	cfg := &config.Config{
 		Breaker: config.BreakerConfig{Enabled: true, FailureThreshold: 2, OpenDuration: "200ms", HalfOpenMax: 1},
 		Chains: map[string]config.ChainConfig{
@@ -115,13 +116,16 @@ func TestHealthCheck5xxTripsBreaker(t *testing.T) {
 	s.SetHealthChecker(hc)
 	m := s.GetChain("test").Models[0]
 
-	// 2 次 503 → 应进入 OPEN
-	hc.update(m, 503, false)
-	hc.update(m, 503, false)
-	if state := s.BreakerStateName(m); state != "open" {
-		t.Fatalf("after 2x 503, breaker = %q, want open", state)
+	// 2 次连接失败（status=0）：不应触发熔断 OPEN
+	hc.update(m, 0, false)
+	hc.update(m, 0, false)
+	if state := s.BreakerStateName(m); state != "closed" {
+		t.Fatalf("after 2x probe failure, breaker = %q, want closed (probe failure must not trip breaker)", state)
+	}
+	if fails := s.ConsecutiveFails(m); fails != 0 {
+		t.Fatalf("after 2x probe failure, consecutive_fails = %d, want 0 (probe failure must not count)", fails)
 	}
 	if st := s.HealthStatus(m); st != HealthUnhealthy {
-		t.Fatalf("after 2x 503, health = %s, want unhealthy", st.String())
+		t.Fatalf("after 2x probe failure, health = %s, want unhealthy", st.String())
 	}
 }
