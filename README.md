@@ -1,18 +1,23 @@
 # auto2api
 
-优先级自动切换的 OpenAI / Claude 兼容 API 网关。多套命名链、按优先级 fallback、同模型退避重试、跨模型故障转移、SSE 流式透传、调用日志按日期落盘。
+优先级自动切换的 OpenAI / Claude 兼容 API 网关。多套命名链、按优先级 fallback、同模型退避重试、跨模型故障转移、熔断器、主动健康检查、SSE 流式透传、调用日志按日期落盘。
+
+> **双运行时**：提供 **Go** 和 **Python** 两套功能完全对齐、彼此独立的实现，共用同一份 `config.yaml`。服务器上装了哪个运行时就用哪个启动，无需同时安装 Go 和 Python。
 
 ## 核心特性
 
 - **Claude（Anthropic Messages API）兼容**：`POST /v1/messages` 入站，请求/响应与流式 SSE 自动做 Claude↔OpenAI 格式转换，Claude SDK 可直连
 - **OpenAI 兼容**：`POST /v1/chat/completions` 透传
-- **命名链**：客户端在 `model` 字段填链名（如 `auto` / `cn`），即可走对应链的优先级组
+- **命名链**：客户端在 `model` 字段填链名（如 `auto` / `cn` / `coding`），即可走对应链的优先级组
 - **两级 fallback**
   - 层 1：同模型退避重试（`retryable_status`，指数退避封顶 3s）
   - 层 2：跨优先级模型故障转移（`trigger_status`，耗尽重试后切下一优先级）
-- **内存冷却**：失败模型按 `cooldown` 时长置入冷却，`PickNext` 自动跳过
+- **动态路由**：在可用模型集合内按 优先级 > 健康 > 成功率 > 延迟(EMA) 综合排序选最优
+- **熔断器（可选）**：连续失败达阈值 → OPEN 长期摘除；冷却到期转 HALF_OPEN 半开探测；探测成功 → CLOSED 恢复
+- **主动健康检查（可选）**：后台周期性对每个上游发轻量探测请求，探测成功复位熔断器
+- **内存冷却**：失败模型按 `cooldown` 时长置入冷却，选择时自动跳过
 - **模型映射**：客户端传链名，转发时改写为上游真实模型名
-- **SSE 管道式透传**：逐行 Flush、空闲超时、keepalive ping、禁用 nginx 缓冲
+- **SSE 管道式透传**：逐行推送、空闲超时、keepalive ping、禁用 nginx 缓冲
 - **鉴权注入**：支持 `Authorization`(默认) / `x-api-key` / `x-goog-api-key` / 自定义头
 - **服务级 API Key**：可配置多个 key，客户端调用须携带其中之一；未配置则不鉴权
 - **头部白名单**：刻意剥离 `authorization` / `cookie` 等，避免泄露客户端凭据
@@ -21,11 +26,35 @@
 
 ## 快速开始
 
+本项目提供 **Go** 和 **Python** 两套功能完全对齐、彼此独立的实现，共用同一份 `config.yaml`。服务器上装了哪个运行时就用哪个启动，二者互不依赖。
+
+### 方式一：Go 模式（无需安装 Python）
+
 ```bash
 go run . -config config.yaml
+# 或编译后运行
+go build -o auto2api . && ./auto2api -config config.yaml
 ```
 
-默认监听 `:8080`，启动日志会列出所有链名与日志开关。
+### 方式二：Python 模式（无需安装 Go）
+
+```bash
+cd python
+pip install -r requirements.txt          # 首次运行安装依赖：starlette / uvicorn / httpx / PyYAML
+python main.py -config ../config.yaml     # -config 指向配置文件（可用相对/绝对路径）
+```
+
+两种方式默认都监听 `config.yaml` 里的 `server.addr`（缺省 `:8080`），启动日志会列出所有链名与开关状态，例如：
+
+```
+auto2api(python) listening, chains: ['cn', 'coding'], breaker: enabled, call_log: True
+health checker enabled: interval=60s timeout=10s
+Uvicorn running on http://0.0.0.0:8686
+```
+
+> **提示**：`log.dir` 用相对路径时，日志目录相对于**启动时的工作目录**。例如从 `python/` 目录启动则日志落在 `python/logs/`，从仓库根启动则落在 `logs/`。
+
+所有端点、fallback 编排、Claude/OpenAI 转换、熔断、健康检查、调用日志行为在两种模式下完全一致。
 
 ## API 端点
 
@@ -36,7 +65,7 @@ go run . -config config.yaml
 | POST | `/v1/messages` | **Claude（Anthropic Messages API）兼容**，`model` 字段填链名 |
 | POST | `/messages` | 无 `/v1` 前缀的 Claude 兼容路径 |
 | GET  | `/v1/models` | 列出所有链名（OpenAI /v1/models 格式） |
-| GET  | `/v1/health` | 每条链各模型的实时健康（优先级、上游模型、是否冷却中） |
+| GET  | `/v1/health` | 每条链各模型的实时健康：优先级、上游模型、是否冷却中、熔断状态、连续失败数、探活健康、延迟 EMA、成功率、总请求/失败数（无需鉴权） |
 
 ### 调用示例
 
@@ -109,8 +138,25 @@ log:
   body_limit: 65536             # 请求/响应体记录上限（字节），超出截断
   log_upstream: true            # 是否记录转发到上游的请求体
 
+# 熔断器（可选，默认关闭）。叠加在 failover.cooldown 之上：
+# 单次失败 → cooldown 短期冷却；连续失败达阈值 → 熔断 OPEN，期间所有请求直接跳过该模型，
+# 冷却到期转 HALF_OPEN 仅放行少量探测请求，探测成功 → CLOSED，探测失败 → 重新 OPEN。
+breaker:
+  enabled: false                # 总开关
+  failure_threshold: 3          # 连续失败多少次进入 OPEN
+  open_duration: "60s"          # OPEN 持续时间，到期转 HALF_OPEN
+  half_open_max: 1              # HALF_OPEN 允许的并发探测请求数（通常 1）
+
+# 后台主动健康检查（可选，默认关闭）。周期性对每个上游发轻量探测请求（空 messages），
+# 探针失败不驱动熔断器（由真实请求驱动），探针成功复位熔断器 CLOSED；不计入业务指标。
+health_check:
+  enabled: false                # 总开关
+  interval: "60s"               # 探活周期
+  timeout: "10s"                # 单次探活请求超时
+
 chains:
   auto:                       # 链名 = 客户端 model 字段值
+    models:                   # 也可省略 models: 直接写模型列表（两种写法均支持）
     - name: gpt               # 优先级 1（最高）
       priority: 1
       upstream:
@@ -145,6 +191,13 @@ chains:
 | `log.redact_keys` | `true` | 脱敏鉴权头部 |
 | `log.body_limit` | `65536` | 请求/响应体记录上限（字节） |
 | `log.log_upstream` | `true` | 是否记录转发上游的请求体 |
+| `breaker.enabled` | `false` | 熔断器总开关 |
+| `breaker.failure_threshold` | `5` | 连续失败多少次进入 OPEN |
+| `breaker.open_duration` | `60s` | OPEN 持续时间，到期转 HALF_OPEN |
+| `breaker.half_open_max` | `1` | HALF_OPEN 并发探测请求数 |
+| `health_check.enabled` | `false` | 主动健康检查总开关 |
+| `health_check.interval` | `30s` | 探活周期 |
+| `health_check.timeout` | `10s` | 单次探活请求超时 |
 | `upstream.timeout` | `120s` | 上游请求超时 |
 | `upstream.auth_header` | `Authorization` | 鉴权头类型 |
 | `failover.cooldown` | `60s` | 失败模型冷却时长 |
@@ -171,30 +224,73 @@ chains:
 
 这样 `429`（同时是 retryable + failover）会先重试、耗尽后再转移；`401/403/500`（仅 failover）则立即转移。
 
+一次真实故障转移在调用日志里的 `attempts` 字段体现为（优先级 1 上游报错 → 切优先级 2 成功）：
+
+```json
+"attempts": [
+  {"model": "bad",  "priority": 1, "status": 503, "outcome": "failover"},
+  {"model": "good", "priority": 2, "status": 200, "outcome": "success"}
+]
+```
+
 ## 项目结构
 
 ```
 auto2api/
-├── main.go                       # 入口：加载配置，启动 gin 服务
-├── config.yaml                    # 多链 + 优先级 + 日志配置
-├── internal/
-│   ├── config/
-│   │   └── config.go              # YAML 解析、默认值、${ENV} 展开
+├── config.yaml                    # 多链 + 优先级 + 日志配置（Go / Python 共用）
+├── config.example.yaml            # 配置模板
+│
+├── main.go                        # Go 入口：加载配置，启动 gin 服务
+├── go.mod
+├── internal/                      # —— Go 实现 ——
+│   ├── config/config.go           # YAML 解析、默认值、${ENV} 展开
 │   └── gateway/
 │       ├── handler.go             # 路由 + fallback 编排 + 调用日志集成
-│       ├── scheduler.go           # 链管理、冷却表、优先级选择
+│       ├── scheduler.go           # 链管理、冷却表、优先级选择、动态路由
 │       ├── forwarder.go           # 上游转发、模型改写、SSE 管道
 │       ├── claude.go              # Claude API 请求/响应/流式格式转换
+│       ├── breaker.go             # 熔断器三态机
+│       ├── metrics.go             # EMA 延迟/成功率指标
+│       ├── healthcheck.go         # 后台主动探活
 │       └── call_logger.go         # 按日期轮转调用日志 + 响应录制
-└── go.mod
+│
+└── python/                        # —— Python 实现（与 Go 功能对齐，完全独立）——
+    ├── main.py                    # Python 入口：uvicorn + Starlette
+    ├── requirements.txt           # starlette / uvicorn / httpx / PyYAML
+    └── auto2api/
+        ├── config.py              # YAML 解析、默认值、${ENV} 展开、时长解析
+        ├── handler.py             # 路由 + 两级 fallback 编排 + 调用日志
+        ├── scheduler.py           # 链管理、冷却表、优先级选择、动态路由
+        ├── forwarder.py           # 上游转发（httpx）、模型改写、SSE 管道
+        ├── claude.py              # Claude API 请求/响应/流式格式转换
+        ├── breaker.py             # 熔断器三态机
+        ├── metrics.py             # EMA 延迟/成功率指标
+        ├── healthcheck.py         # 后台主动探活（asyncio）
+        ├── call_logger.py         # 按日期轮转调用日志 + 响应录制
+        └── server.py              # Starlette 应用装配、路由注册、生命周期
 ```
+
+> Go 版与 Python 版实现相同的端点与行为，可按服务器已安装的运行时任选其一启动，无需同时安装 Go 和 Python。
 
 ## 设计要点
 
-- **手动构造上游 `*http.Request`**（非 `httputil.ReverseProxy`）：精确控制头部白名单与模型改写
-- **`http.Client.Timeout=0`**：流式安全，由请求级 `context.WithTimeout` 控制截止
-- **`BodyCommitted` 标记**：流式中途失败时响应体已写，不可再 fallback，直接结束
+**通用**
+
+- **头部白名单 + 鉴权注入**：手动构造上游请求（非反向代理），精确控制透传头部与模型改写
 - **冷却键 `chain::name`**：按链隔离，避免跨链同名模型互相污染
-- **单行 64MB 缓冲**：`bufio.Scanner` 容纳上游长行 SSE
 - **出站格式标记**：`/v1/messages` 置 `outbound_format=claude`，forwarder 据此分流 Claude 转换管线
-- **响应录制器**：包裹 `gin.ResponseWriter` 透写同时缓存，请求结束时把最终输出（含格式转换后）记入日志
+- **响应录制器**：透写给客户端的同时缓存，请求结束时把最终输出（含格式转换后）记入日志
+
+**Go 版**
+
+- 手动构造上游 `*http.Request`（非 `httputil.ReverseProxy`）
+- `http.Client.Timeout=0`：流式安全，由请求级 `context.WithTimeout` 控制截止
+- `BodyCommitted` 标记：流式中途失败时响应体已写，不可再 fallback，直接结束
+- 单行 64MB 缓冲：`bufio.Scanner` 容纳上游长行 SSE
+
+**Python 版**
+
+- 基于 `Starlette + uvicorn + httpx`（asyncio）
+- 转发用 `httpx.stream(...)` 先拿状态码：非 2xx 仍可 fallback，2xx 才提交响应体（等价于 Go 的 `BodyCommitted` 语义）
+- 共享 `httpx.AsyncClient`，并在事件循环变化时惰性重建连接池
+- 健康检查为 asyncio 后台任务，随应用 `on_startup/on_shutdown` 生命周期启停

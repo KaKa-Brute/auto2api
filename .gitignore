@@ -7,7 +7,8 @@ config.yaml
 *.dll
 *.so
 *.dylib
-auto2api
+/auto2api
+/auto2api.exe
 
 # 测试产物
 *.test
@@ -30,6 +31,13 @@ go.work.sum
 *.swp
 *.swo
 *~
+
+# Python 版产物
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
 
 # 系统文件
 .DS_Store

@@ -1,0 +1,5 @@
+# auto2api Python 版依赖（与 Go 版完全独立）
+starlette>=0.37.0
+uvicorn>=0.29.0
+httpx>=0.27.0
+PyYAML>=6.0
