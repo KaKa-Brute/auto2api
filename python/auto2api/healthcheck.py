@@ -1,7 +1,7 @@
 """后台主动健康检查：周期性探活每个上游模型。对齐 Go 版 internal/gateway/healthcheck.go。
 
 探活不经过 Forwarder（避免污染业务指标与调用日志），用独立 httpx.AsyncClient
-发一个空 messages 的最小请求，只看状态码判断端点是否可达。
+发一条最小 user 消息 + max_tokens=1 的请求，只看状态码判断端点是否可达。
 """
 import asyncio
 import json
@@ -43,10 +43,17 @@ class HealthChecker:
         return HealthChecker(scheduler, interval, timeout)
 
     def _probe_body(self, m) -> bytes:
-        """轻量探活请求体：只发 model + 空 messages，上游快速校验返回。"""
+        """轻量探活请求体：一条最小 user 消息 + max_tokens=1。
+
+        不能发空 messages——部分上游网关（如 new-api）对空 messages 返回 500
+        参数校验错误，会被误判为服务故障并刷屏日志。带一条真实消息 + max_tokens=1
+        既能真正探到"模型可生成"，又几乎不消耗 token。
+        用该模型配置的真实上游模型名，避免模型名校验回 404/503 假阴性。
+        """
         return json.dumps({
             "model": m.cfg.upstream.model,
-            "messages": [],
+            "messages": [{"role": "user", "content": "ping"}],
+            "max_tokens": 1,
         }).encode("utf-8")
 
     def _probe_headers(self, m) -> Dict[str, str]:

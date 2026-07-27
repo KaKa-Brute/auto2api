@@ -62,15 +62,17 @@ func NewHealthChecker(s *Scheduler, interval, timeout time.Duration) *HealthChec
 	}
 }
 
-// probeBody 为指定模型构造轻量探活请求体。
-// 只发 model + 空 messages，不带 max_tokens——上游校验 messages 为空会快速返回 400，
-// 不需要等模型生成 token。这样能避免某些模型（如 Claude）对 max_tokens=1 响应极慢导致探针超时。
+// probeBody 为指定模型构造轻量探活请求体：一条最小 user 消息 + max_tokens=1。
+// 不能发空 messages——部分上游网关（如 new-api）对空 messages 返回 500 参数校验错误，
+// 会被误判为服务故障并刷屏日志。带一条真实消息 + max_tokens=1 既能真正探到
+// “模型可生成”，又几乎不消耗 token。
 // 关键：用该模型配置的真实上游模型名（m.Cfg.Upstream.Model），
-// 而不是硬编码 "ping"——否则上游校验模型名会回 404/400 被误判为不可用。
+// 而不是硬编码——否则上游校验模型名会回 404/503 被误判为不可用。
 func (h *HealthChecker) probeBody(m *Model) []byte {
 	body, _ := json.Marshal(map[string]any{
-		"model":    m.Cfg.Upstream.Model,
-		"messages": []map[string]string{},
+		"model":      m.Cfg.Upstream.Model,
+		"messages":   []map[string]string{{"role": "user", "content": "ping"}},
+		"max_tokens": 1,
 	})
 	return body
 }
@@ -135,7 +137,7 @@ func (h *HealthChecker) probeAll() {
 }
 
 // probe 轻量探测单个模型，只检查上游端点是否可达，不等待模型生成响应。
-//   - 发送空 messages 请求，上游校验失败会快速返回错误（不用等模型生成 token）
+//   - 发送一条最小 user 消息 + max_tokens=1，几乎不消耗 token 即可探到模型可生成
 //   - 收到 HTTP 响应（非 5xx）→ 端点可达（healthy）
 //   - 5xx → 上游服务故障（unhealthy）
 //   - 网络错误/超时 → 端点不可达（unhealthy）
