@@ -30,7 +30,12 @@ def build_app(cfg: cfgmod.Config) -> Starlette:
     """从配置构建 Starlette 应用（含调度器、转发器、日志、健康检查、路由）。"""
     scheduler = Scheduler(cfg)
     logger = CallLogger(cfg.log.dir, cfg.log.enabled, cfg.log.redact_keys,
-                        cfg.log.log_upstream, cfg.log.body_limit)
+                        cfg.log.log_upstream, cfg.log.body_limit,
+                        log_resp_body=cfg.log.log_resp_body,
+                        max_size_mb=cfg.log.max_size_mb,
+                        max_age_days=cfg.log.max_age_days,
+                        max_backups=cfg.log.max_backups,
+                        compress=cfg.log.compress)
     forwarder = Forwarder(logger)
     handler = Handler(scheduler, forwarder, cfg.server.max_model_switches,
                       cfg.server.api_keys, logger)

@@ -103,8 +103,13 @@ class LogConfig:
     enabled: bool = False
     dir: str = "logs"
     redact_keys: bool = True
-    body_limit: int = 65536
+    body_limit: int = 8192
     log_upstream: bool = True
+    log_resp_body: bool = True
+    max_size_mb: int = 100
+    max_age_days: int = 7
+    max_backups: int = 10
+    compress: bool = True
 
 
 @dataclass
@@ -181,6 +186,11 @@ def load(path: str) -> Config:
         redact_keys=bool(lg.get("redact_keys", True)),
         body_limit=int(lg.get("body_limit", 0) or 0),
         log_upstream=bool(lg.get("log_upstream", True)),
+        log_resp_body=bool(lg.get("log_resp_body", True)),
+        max_size_mb=int(lg.get("max_size_mb", 0) or 0),
+        max_age_days=int(lg.get("max_age_days", 0) or 0),
+        max_backups=int(lg.get("max_backups", 0) or 0),
+        compress=bool(lg.get("compress", True)),
     )
     bk = raw.get("breaker", {}) or {}
     breaker = BreakerConfig(
@@ -206,7 +216,13 @@ def load(path: str) -> Config:
     if not cfg.log.dir:
         cfg.log.dir = "logs"
     if cfg.log.body_limit <= 0:
-        cfg.log.body_limit = 64 * 1024
+        cfg.log.body_limit = 8 * 1024
+    if cfg.log.max_size_mb <= 0:
+        cfg.log.max_size_mb = 100
+    if cfg.log.max_age_days <= 0:
+        cfg.log.max_age_days = 7
+    if cfg.log.max_backups <= 0:
+        cfg.log.max_backups = 10
     if cfg.breaker.enabled:
         if cfg.breaker.failure_threshold <= 0:
             cfg.breaker.failure_threshold = 5

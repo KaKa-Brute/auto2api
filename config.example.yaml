@@ -8,13 +8,18 @@ server:
     - "sk-auto2api-CHANGE_ME"     # 可配多个方便轮换；支持 ${ENV} 展开
     # - "${AUTO2API_KEY2}"
 
-# 调用日志：记录完整调用过程与输入输出，按日期落盘（logs/calls-YYYY-MM-DD.log）
+# 调用日志：记录完整调用过程与输入输出，按日期 + 大小轮转（logs/calls-YYYY-MM-DD.log）
 log:
   enabled: false                  # 总开关，默认关闭
-  dir: "logs"                     # 日志目录（按日期轮转）
+  dir: "logs"                     # 日志目录（按日期 + 大小轮转）
   redact_keys: true               # 脱敏 Authorization / x-api-key，避免凭据泄露
-  body_limit: 65536               # 请求/响应体记录上限（字节），超出截断
+  body_limit: 8192               # 请求/响应体记录上限（字节），超出截断
   log_upstream: true              # 是否记录转发到上游的请求体
+  log_resp_body: true             # 是否记录响应体（关闭可大幅减小日志体积）
+  max_size_mb: 100               # 单文件大小上限（MB），超出后按 .1/.2 后缀轮转
+  max_age_days: 7                # 日志最大保留天数，超期自动删除
+  max_backups: 10                # 每天最多保留的轮转文件数，超出删最旧
+  compress: true                 # 轮转后的旧文件自动 gzip 压缩
 
 # 熔断器（可选，默认关闭）。叠加在 failover.cooldown 之上：
 # 单次失败 → cooldown 短期冷却；连续失败达阈值 → 熔断 OPEN，期间所有请求直接跳过该模型，

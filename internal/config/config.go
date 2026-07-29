@@ -32,8 +32,13 @@ type LogConfig struct {
 	Enabled      bool   `yaml:"enabled"`        // 总开关，默认 false
 	Dir          string `yaml:"dir"`            // 日志目录，默认 "logs"
 	RedactKeys   bool   `yaml:"redact_keys"`    // 脱敏 Authorization / x-api-key，默认 true
-	BodyLimit    int    `yaml:"body_limit"`     // 请求/响应体记录上限（字节），超出截断，默认 65536
+	BodyLimit    int    `yaml:"body_limit"`     // 请求/响应体记录上限（字节），超出截断，默认 8192
 	LogUpstream  bool   `yaml:"log_upstream"`   // 是否记录转发到上游的请求体，默认 true
+	LogRespBody  bool   `yaml:"log_resp_body"`  // 是否记录响应体，默认 true
+	MaxSizeMB    int    `yaml:"max_size_mb"`     // 单文件大小上限（MB），超出后按 .1/.2 后缀轮转，默认 100
+	MaxAgeDays   int    `yaml:"max_age_days"`   // 日志最大保留天数，超期自动删除，默认 7
+	MaxBackups   int    `yaml:"max_backups"`    // 每天最多保留的轮转文件数，超出删最旧，默认 10
+	Compress     bool   `yaml:"compress"`       // 轮转后的旧文件自动 gzip 压缩，默认 true
 }
 
 // ChainConfig 是一条命名优先级链，外部按链名调用。
@@ -139,7 +144,16 @@ func Load(path string) (*Config, error) {
 		c.Log.Dir = "logs"
 	}
 	if c.Log.BodyLimit <= 0 {
-		c.Log.BodyLimit = 64 * 1024
+		c.Log.BodyLimit = 8 * 1024
+	}
+	if c.Log.MaxSizeMB <= 0 {
+		c.Log.MaxSizeMB = 100
+	}
+	if c.Log.MaxAgeDays <= 0 {
+		c.Log.MaxAgeDays = 7
+	}
+	if c.Log.MaxBackups <= 0 {
+		c.Log.MaxBackups = 10
 	}
 	// 熔断器默认值
 	if c.Breaker.Enabled {

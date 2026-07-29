@@ -15,6 +15,12 @@ HEALTH_UNKNOWN = 0
 HEALTH_HEALTHY = 1
 HEALTH_UNHEALTHY = 2
 
+# 默认重试状态码：即使配置遗漏也能对常见上游故障做退避重试
+_DEFAULT_RETRYABLE = {429, 500, 502, 503, 529}
+
+# 默认故障转移状态码：即使配置遗漏也能对常见上游故障自动切换下一优先级
+_DEFAULT_FAILOVER = {401, 403, 429, 500, 502, 503, 529}
+
 
 def health_status_name(s: int) -> str:
     return {HEALTH_HEALTHY: "healthy", HEALTH_UNHEALTHY: "unhealthy"}.get(s, "unknown")
@@ -31,8 +37,8 @@ class Model:
             self.backoffs = cfgmod.parse_durations(mc.retry.backoff)
         except ValueError:
             self.backoffs = []
-        self.retryable = set(mc.retry.retryable_status)
-        self.failover = set(mc.failover.trigger_status)
+        self.retryable = set(mc.retry.retryable_status) | _DEFAULT_RETRYABLE
+        self.failover = set(mc.failover.trigger_status) | _DEFAULT_FAILOVER
         self.cooldown = cfgmod.parse_duration(mc.failover.cooldown or "60s")
         self.idle_timeout = cfgmod.parse_duration(mc.stream.idle_timeout or "30s")
         self.keepalive = cfgmod.parse_duration(mc.stream.keepalive or "5s")

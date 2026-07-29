@@ -3,13 +3,17 @@
 package gateway
 
 import (
+	"bufio"
 	"bytes"
+	"compress/gzip"
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -17,26 +21,37 @@ import (
 	"github.com/gin-gonic/gin"
 )
 
-// CallLogger 是按日期轮转的调用日志记录器。
+// CallLogger 是按日期 + 大小轮转的调用日志记录器。
 type CallLogger struct {
-	mu        sync.Mutex
-	enabled   bool
-	dir       string
-	redact    bool
-	bodyLimit int
-	upstream  bool
-	file      *os.File
-	fileDate  string
+	mu           sync.Mutex
+	enabled      bool
+	dir          string
+	redact       bool
+	bodyLimit    int
+	upstream     bool
+	logRespBody  bool
+	maxSizeBytes int64
+	maxAgeDays   int
+	maxBackups   int
+	compress     bool
+	file         *os.File
+	fileDate     string
 }
 
 // NewCallLogger 构造一个调用日志记录器。
-func NewCallLogger(dir string, enabled, redact, upstream bool, bodyLimit int) *CallLogger {
+func NewCallLogger(dir string, enabled, redact, upstream bool, bodyLimit int,
+	logRespBody bool, maxSizeMB, maxAgeDays, maxBackups int, compress bool) *CallLogger {
 	return &CallLogger{
-		enabled:   enabled,
-		dir:       dir,
-		redact:    redact,
-		bodyLimit: bodyLimit,
-		upstream:  upstream,
+		enabled:      enabled,
+		dir:          dir,
+		redact:       redact,
+		bodyLimit:    bodyLimit,
+		upstream:     upstream,
+		logRespBody:  logRespBody,
+		maxSizeBytes: int64(maxSizeMB) * 1024 * 1024,
+		maxAgeDays:   maxAgeDays,
+		maxBackups:   maxBackups,
+		compress:     compress,
 	}
 }
 
@@ -167,7 +182,7 @@ func (l *CallLogger) End(e *CallEntry, status int, err error) {
 	}
 	e.RespStatus = status
 	e.DurationMs = time.Since(e.start).Milliseconds()
-	if e.rec != nil {
+	if l.logRespBody && e.rec != nil {
 		e.RespBody = truncate(e.rec.buf.String(), l.bodyLimit)
 		e.RespChunks = e.rec.chunkCount
 	}
@@ -188,26 +203,161 @@ func (l *CallLogger) write(e *CallEntry) {
 	l.file.Write([]byte("\n"))
 }
 
-// rotateFile 按当天日期打开/切换日志文件（调用前已持锁）。
+// rotateFile 按当天日期打开/切换日志文件，并在文件超限时按大小轮转（调用前已持锁）。
 func (l *CallLogger) rotateFile() error {
 	today := time.Now().Format("2006-01-02")
-	if l.file != nil && today == l.fileDate {
-		return nil
-	}
-	if l.file != nil {
+	// 跨天：关闭当前文件，清理旧文件
+	if l.file != nil && today != l.fileDate {
 		l.file.Close()
+		l.file = nil
+		l.fileDate = ""
+		l.cleanup()
 	}
-	if err := os.MkdirAll(l.dir, 0o755); err != nil {
-		return err
+	// 打开新文件
+	if l.file == nil {
+		if err := os.MkdirAll(l.dir, 0o755); err != nil {
+			return err
+		}
+		path := filepath.Join(l.dir, "calls-"+today+".log")
+		f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
+		if err != nil {
+			return err
+		}
+		l.file = f
+		l.fileDate = today
 	}
-	path := filepath.Join(l.dir, "calls-"+today+".log")
-	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
-	if err != nil {
-		return err
+	// 大小轮转：当前文件超限 → 重命名 + 压缩 + 开新文件
+	if l.maxSizeBytes > 0 {
+		if info, err := l.file.Stat(); err == nil && info.Size() >= l.maxSizeBytes {
+			l.file.Close()
+			l.rotateAndCompress(today)
+			l.cleanup()
+			path := filepath.Join(l.dir, "calls-"+today+".log")
+			f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
+			if err != nil {
+				return err
+			}
+			l.file = f
+		}
 	}
-	l.file = f
-	l.fileDate = today
 	return nil
+}
+
+// rotateAndCompress 将当前日志文件重命名为带序号的备份，并按需 gzip 压缩。
+func (l *CallLogger) rotateAndCompress(date string) {
+	src := filepath.Join(l.dir, "calls-"+date+".log")
+	// 找下一个可用序号
+	for n := 1; n <= 9999; n++ {
+		dst := filepath.Join(l.dir, fmt.Sprintf("calls-%s.%d.log", date, n))
+		if _, err := os.Stat(dst); os.IsNotExist(err) {
+			if _, err := os.Stat(dst + ".gz"); os.IsNotExist(err) {
+				if err := os.Rename(src, dst); err == nil {
+					if l.compress {
+						l.gzipFile(dst)
+						os.Remove(dst)
+					}
+				}
+				return
+			}
+		}
+	}
+}
+
+// gzipFile 将 src 压缩为 src.gz。
+func (l *CallLogger) gzipFile(src string) {
+	in, err := os.Open(src)
+	if err != nil {
+		return
+	}
+	defer in.Close()
+	out, err := os.Create(src + ".gz")
+	if err != nil {
+		return
+	}
+	defer out.Close()
+	gw := gzip.NewWriter(out)
+	defer gw.Close()
+	bw := bufio.NewWriter(gw)
+	bw.ReadFrom(in)
+	bw.Flush()
+}
+
+// cleanup 清理超龄文件和超额备份（调用前已持锁）。
+func (l *CallLogger) cleanup() {
+	if l.maxAgeDays <= 0 && l.maxBackups <= 0 {
+		return
+	}
+	entries, err := os.ReadDir(l.dir)
+	if err != nil {
+		return
+	}
+	now := time.Now()
+	// 按日期分组的轮转文件
+	type rotFile struct {
+		name    string
+		modTime time.Time
+	}
+	byDate := make(map[string][]rotFile)
+	for _, e := range entries {
+		name := e.Name()
+		if !strings.HasPrefix(name, "calls-") {
+			continue
+		}
+		info, err := e.Info()
+		if err != nil {
+			continue
+		}
+		// 超龄删除：按文件名中的日期判断
+		if l.maxAgeDays > 0 {
+			dateStr := logDateFromName(name)
+			if dateStr != "" {
+				if t, err := time.Parse("2006-01-02", dateStr); err == nil {
+					if now.Sub(t).Hours()/24 >= float64(l.maxAgeDays) {
+						os.Remove(filepath.Join(l.dir, name))
+						continue
+					}
+				}
+			}
+		}
+		// 收集轮转文件（非当前活跃文件，即含 .N. 的文件）
+		if isRotated(name) {
+			dateStr := logDateFromName(name)
+			byDate[dateStr] = append(byDate[dateStr], rotFile{name: name, modTime: info.ModTime()})
+		}
+	}
+	// 按日期分组，超出 maxBackups 的删最旧
+	if l.maxBackups > 0 {
+		for _, files := range byDate {
+			if len(files) <= l.maxBackups {
+				continue
+			}
+			sort.Slice(files, func(i, j int) bool {
+				return files[i].modTime.Before(files[j].modTime)
+			})
+			for i := 0; i < len(files)-l.maxBackups; i++ {
+				os.Remove(filepath.Join(l.dir, files[i].name))
+			}
+		}
+	}
+}
+
+// logDateFromName 从文件名提取 YYYY-MM-DD 日期。
+// 支持格式：calls-2026-07-29.log、calls-2026-07-29.1.log、calls-2026-07-29.1.log.gz
+func logDateFromName(name string) string {
+	const prefix = "calls-"
+	if !strings.HasPrefix(name, prefix) {
+		return ""
+	}
+	rest := name[len(prefix):]
+	if len(rest) < 10 {
+		return ""
+	}
+	return rest[:10]
+}
+
+// isRotated 判断是否为轮转备份文件（含 .N. 的文件名）。
+func isRotated(name string) bool {
+	return strings.Contains(name, ".log.") && !strings.HasSuffix(name, ".log")
 }
 
 func truncate(s string, limit int) string {

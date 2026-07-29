@@ -29,6 +29,12 @@ type Model struct {
 	Timeout     time.Duration
 }
 
+// 默认重试状态码：即使配置遗漏也能对常见上游故障做退避重试
+var defaultRetryable = map[int]bool{429: true, 500: true, 502: true, 503: true, 529: true}
+
+// 默认故障转移状态码：即使配置遗漏也能对常见上游故障自动切换下一优先级
+var defaultFailover = map[int]bool{401: true, 403: true, 429: true, 500: true, 502: true, 503: true, 529: true}
+
 // cooldownKey 返回模型在冷却表/熔断表/指标表中的唯一键。
 func (m *Model) cooldownKey() string { return m.ChainName + "::" + m.Cfg.Name }
 
@@ -136,7 +142,13 @@ func buildModel(mc config.ModelConfig) (*Model, error) {
 	for _, s := range mc.Retry.RetryableStatus {
 		m.Retryable[s] = true
 	}
+	for s := range defaultRetryable {
+		m.Retryable[s] = true
+	}
 	for _, s := range mc.Failover.TriggerStatus {
+		m.Failover[s] = true
+	}
+	for s := range defaultFailover {
 		m.Failover[s] = true
 	}
 	cd, err := time.ParseDuration(orDefault(mc.Failover.Cooldown, "60s"))

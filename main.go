@@ -34,7 +34,9 @@ func main() {
 		hc.Start()
 		log.Printf("health checker enabled: interval=%s timeout=%s", interval, timeout)
 	}
-	logger := gateway.NewCallLogger(cfg.Log.Dir, cfg.Log.Enabled, cfg.Log.RedactKeys, cfg.Log.LogUpstream, cfg.Log.BodyLimit)
+	logger := gateway.NewCallLogger(cfg.Log.Dir, cfg.Log.Enabled, cfg.Log.RedactKeys,
+		cfg.Log.LogUpstream, cfg.Log.BodyLimit, cfg.Log.LogRespBody,
+		cfg.Log.MaxSizeMB, cfg.Log.MaxAgeDays, cfg.Log.MaxBackups, cfg.Log.Compress)
 	fwd := gateway.NewForwarder(logger)
 	h := gateway.NewHandler(sched, fwd, cfg.Server.MaxModelSwitches, cfg.Server.APIKeys, logger)
 
