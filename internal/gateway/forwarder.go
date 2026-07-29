@@ -11,11 +11,15 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"regexp"
 	"strings"
 	"time"
 
 	"github.com/gin-gonic/gin"
 )
+
+// versionSuffixRe 匹配以 /v<数字> 结尾的 base_url（如 /v1、/v3）。
+var versionSuffixRe = regexp.MustCompile(`/v\d+$`)
 
 // UpstreamError 表示上游返回了非 2xx 状态码（已读取错误体，响应未提交，可 fallback）。
 type UpstreamError struct {
@@ -128,7 +132,8 @@ func buildURL(baseURL string) string {
 	if strings.HasSuffix(b, "/chat/completions") {
 		return b
 	}
-	if strings.HasSuffix(b, "/v1") {
+	// 已以版本段结尾（如 /v1、/v3）时只追加 /chat/completions，避免重复 /v1。
+	if versionSuffixRe.MatchString(b) {
 		return b + "/chat/completions"
 	}
 	return b + "/v1/chat/completions"

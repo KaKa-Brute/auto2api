@@ -6,6 +6,7 @@
 """
 import asyncio
 import json
+import re
 import time
 from typing import Any, Dict, Optional, Tuple
 
@@ -43,12 +44,19 @@ ALLOWED_HEADERS = {
 }
 
 
+_VERSION_SUFFIX_RE = re.compile(r"/v\d+$")
+
+
 def build_url(base_url: str) -> str:
-    """规整 base_url：补齐 /v1/chat/completions。对齐 Go buildURL。"""
+    """规整 base_url：补齐 /v1/chat/completions。对齐 Go buildURL。
+
+    若 base_url 已以版本段结尾（如 /v1、/v3），只追加 /chat/completions，
+    避免出现重复的 /v1（如 .../api/coding/v3/v1/chat/completions）。
+    """
     b = base_url.rstrip("/")
     if b.endswith("/chat/completions"):
         return b
-    if b.endswith("/v1"):
+    if _VERSION_SUFFIX_RE.search(b):
         return b + "/chat/completions"
     return b + "/v1/chat/completions"
 
