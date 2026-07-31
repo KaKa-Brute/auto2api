@@ -3,3 +3,5 @@ starlette>=0.37.0
 uvicorn>=0.29.0
 httpx>=0.27.0
 PyYAML>=6.0
+# 内存守护（protection.max_memory_mb）跨平台读进程 RSS 用；未安装则内存守护自动禁用
+psutil>=5.9.0

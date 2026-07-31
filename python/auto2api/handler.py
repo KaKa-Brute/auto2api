@@ -14,6 +14,7 @@ from starlette.responses import JSONResponse, Response
 from . import claude as claudemod
 from .call_logger import AttemptLog
 from .forwarder import UpstreamError
+from .limiter import RateLimitError
 
 _log = logging.getLogger("auto2api.handler")
 
@@ -101,6 +102,64 @@ class Handler:
         self._max_switches = max_switches
         self._logger = logger
         self._api_keys = set(k for k in (api_keys or []) if k)
+        self._limiter = None    # 并发限流器（可选）
+        self._memguard = None   # 内存守护（可选）
+
+    def set_protection(self, limiter, memguard) -> None:
+        """注入并发限流器与内存守护（由 server 构造后注入）。"""
+        self._limiter = limiter
+        self._memguard = memguard
+
+    def _check_protection(self, outbound_format: str):
+        """入口内存降级检查：降级模式下快速拒绝（503）。返回错误响应或 None。"""
+        if self._memguard is not None:
+            allowed, reason = self._memguard.allow_request()
+            if not allowed:
+                resp = json_error(503, "overloaded_error",
+                                  "server overloaded: " + reason, outbound_format)
+                resp.headers["Retry-After"] = "5"
+                return resp
+        return None
+
+    async def _acquire_limit(self, outbound_format: str):
+        """并发限流获取槽位。成功返回 True；未启用返回 False；
+        被限流返回 503 Response（调用方须直接返回）。"""
+        if self._limiter is None:
+            return False
+        try:
+            await self._limiter.acquire()
+            return True
+        except RateLimitError as e:
+            resp = json_error(503, "overloaded_error",
+                              "too many concurrent requests: " + str(e),
+                              outbound_format)
+            resp.headers["Retry-After"] = "3"
+            return resp
+
+    def _attach_release(self, resp: Optional[Response], acquired: bool) -> None:
+        """把限流槽位释放挂到响应的 background，确保流式响应发送完毕后才释放。
+        resp 为 None（处理中抛异常）时直接释放，避免槽位泄漏。"""
+        if not acquired:
+            return
+        if resp is None:
+            self._limiter.release()
+            return
+        from starlette.background import BackgroundTask
+
+        def _release():
+            self._limiter.release()
+
+        existing = getattr(resp, "background", None)
+        if existing is None:
+            resp.background = BackgroundTask(_release)
+        else:
+            # 已有 background：包一层，先跑原任务再释放
+            async def _chain():
+                try:
+                    await existing()
+                finally:
+                    _release()
+            resp.background = BackgroundTask(_chain)
 
     def _check_auth(self, request: Request, outbound_format: str):
         """校验客户端 key。未配置 api_keys 时放行。返回错误响应或 None。"""
@@ -122,20 +181,31 @@ class Handler:
         err = self._check_auth(request, outbound)
         if err is not None:
             return err
+        # 服务保护：内存降级快速拒绝 + 并发限流
+        err = self._check_protection(outbound)
+        if err is not None:
+            return err
+        acquired = await self._acquire_limit(outbound)
+        if isinstance(acquired, Response):
+            return acquired
         entry = self._begin(request, "openai")
         final_status = 200
         final_err: Optional[Exception] = None
+        resp: Optional[Response] = None
         try:
             body = await request.body()
             if not _valid_json(body):
                 final_status = 400
                 final_err = ValueError("request body is not valid JSON")
-                return json_error(400, "invalid_request_error", str(final_err), outbound)
+                resp = json_error(400, "invalid_request_error", str(final_err), outbound)
+                return resp
             resp, final_status, final_err = await self._run_completion(
                 request, body, entry, outbound)
             return resp
         finally:
             self._logger.end(entry, final_status, final_err)
+            # 释放限流槽位：挂到响应 background，确保流式发送完毕后才释放
+            self._attach_release(resp, acquired is True)
 
     async def messages(self, request: Request) -> Response:
         """POST /v1/messages（Anthropic Claude Messages API 兼容）。"""
@@ -143,22 +213,32 @@ class Handler:
         err = self._check_auth(request, outbound)
         if err is not None:
             return err
+        # 服务保护：内存降级快速拒绝 + 并发限流
+        err = self._check_protection(outbound)
+        if err is not None:
+            return err
+        acquired = await self._acquire_limit(outbound)
+        if isinstance(acquired, Response):
+            return acquired
         entry = self._begin(request, "claude")
         final_status = 200
         final_err: Optional[Exception] = None
+        resp: Optional[Response] = None
         try:
             raw_body = await request.body()
             if not _valid_json(raw_body):
                 final_status = 400
                 final_err = ValueError("request body is not valid JSON")
-                return json_error(400, "invalid_request_error", str(final_err), outbound)
+                resp = json_error(400, "invalid_request_error", str(final_err), outbound)
+                return resp
             try:
                 openai_body, _ = claudemod.claude_request_to_openai(raw_body)
             except Exception as ce:  # noqa: BLE001
                 final_status = 400
                 final_err = ce
-                return json_error(400, "invalid_request_error",
+                resp = json_error(400, "invalid_request_error",
                                   "convert claude request: " + str(ce), outbound)
+                return resp
             chain_name = _extract_string(openai_body, "model") or "auto"
             stream_requested = _extract_bool(openai_body, "stream")
             # 记录原始 Claude 请求体（转换前）
@@ -168,6 +248,7 @@ class Handler:
             return resp
         finally:
             self._logger.end(entry, final_status, final_err)
+            self._attach_release(resp, acquired is True)
 
     async def models(self, request: Request) -> Response:
         """GET /v1/models：列出所有链名。"""
@@ -202,6 +283,24 @@ class Handler:
                     "total_failures": fail,
                 })
             out[name] = models
+        # 服务保护运行时状态（并发/内存/异常计数），供监控告警
+        from .recovery import get_panic_stats
+        protection = {"total_panics": get_panic_stats()}
+        if self._limiter is not None:
+            cur, rejected, timeout = self._limiter.stats()
+            protection["concurrency"] = {
+                "current": cur,
+                "total_rejected": rejected,
+                "total_timeout": timeout,
+            }
+        if self._memguard is not None:
+            used_mb, degraded, rejected = self._memguard.stats()
+            protection["memory"] = {
+                "used_mb": used_mb,
+                "degraded": degraded,
+                "total_rejected": rejected,
+            }
+        out["_protection"] = protection
         return JSONResponse(out)
 
     def _begin(self, request: Request, fmt: str):

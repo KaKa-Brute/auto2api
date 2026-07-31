@@ -39,6 +39,21 @@ health_check:
   interval: "30s"                # 探活周期
   timeout: "10s"                 # 单次探活请求超时
 
+# 服务保护（防崩溃三板斧，各项可选，值为 0 / 空表示禁用）：
+#   1. 并发限流：防上游 API 超时导致连接无限堆积撑爆内存/句柄
+#   2. 内存守护：防内存泄漏或 OOM，超阈值自动降级（拒新请求 + 强制 GC）
+#   3. panic recovery：自动启用，捕获未捕获异常防进程退出（无需配置）
+protection:
+  # 并发限流
+  max_concurrent: 200            # 最大并发处理请求数，0=不限制；超出则进队列等待
+  max_queue_size: 400            # 等待队列长度，0=自动(2x max_concurrent)；队列满直接返回 503
+  queue_timeout: "30s"           # 队列等待超时，超时返回 503 + Retry-After，避免请求无限堆积
+  # 内存守护
+  max_memory_mb: 10024            # 进程最大允许内存(MB)，0=不监控；建议设为容器内存上限的 80%
+  memory_warn: 0.8               # 警告阈值(占 max_memory_mb 比例)，超过则主动 GC + 日志告警
+  memory_critical: 0.9           # 临界阈值，超过则拒绝新请求(503)并强制 GC，回落后自动恢复
+  memory_check_interval: "10s"   # 内存检查周期
+
 chains:
   # 默认链：gpt -> glm -> claude 三级 fallback
   auto:

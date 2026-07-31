@@ -1,8 +1,8 @@
 # auto2api
 
-优先级自动切换的 OpenAI / Claude 兼容 API 网关。多套命名链、按优先级 fallback、同模型退避重试、跨模型故障转移、熔断器、主动健康检查、SSE 流式透传、调用日志按日期落盘。
+优先级自动切换的 OpenAI / Claude 兼容 API 网关。多套命名链、按优先级 fallback、同模型退避重试、跨模型故障转移、熔断器、主动健康检查、SSE 流式透传、调用日志按日期落盘、服务保护（并发限流 / 内存守护 / 异常恢复 / 优雅关闭）。
 
-> **双运行时**：提供 **Go** 和 **Python** 两套功能完全对齐、彼此独立的实现，共用同一份 `config.yaml`。服务器上装了哪个运行时就用哪个启动，无需同时安装 Go 和 Python。
+> **双运行时**：提供 **Go** 和 **Python** 两套功能完全对齐、彼此独立的实现，共用同一份 `config.yaml`。服务器上装了哪个运行时就用哪个启动，无需同时安装 Go 和 Python。所有能力（fallback、熔断、健康检查、Claude/OpenAI 转换、调用日志、服务保护）两版一致。
 
 ## 核心特性
 
@@ -23,6 +23,12 @@
 - **头部白名单**：刻意剥离 `authorization` / `cookie` 等，避免泄露客户端凭据
 - **调用日志**：记录完整调用过程与输入输出（请求/上游请求/响应/每次尝试），按日期落盘 `logs/calls-YYYY-MM-DD.log`
 - **环境变量展开**：`api_key: "${DEEPSEEK_KEY}"` 自动替换
+- **服务保护（可选）**：面向进程稳定性的防崩溃三板斧 + 优雅关闭（Go / Python 均实现）
+  - **并发限流**：超过 `max_concurrent` 的请求进等待队列，队列满或等待超时立即返回 `503 + Retry-After`，防止上游超时导致连接无限堆积
+  - **内存守护**：后台周期检测进程内存，超警告阈值主动 GC，超临界阈值进入降级模式（拒新请求 + 强制 GC），内存回落后自动恢复，防内存泄漏 / OOM
+  - **异常恢复**：捕获所有未处理异常（Go panic / Python exception），记录完整堆栈与计数并返回 500，进程不退出（自动启用，无需配置）
+  - **优雅关闭**：收到 `SIGINT`/`SIGTERM` 停止接收新请求，等待在途请求完成后再退出，并停止后台任务
+  - **连接池上限**：上游 HTTP 客户端限制每主机连接数与空闲连接回收，防连接/句柄泄漏
 
 ## 快速开始
 
@@ -40,13 +46,15 @@ go build -o auto2api . && ./auto2api -config config.yaml
 
 ```bash
 cd python
-pip install -r requirements.txt          # 首次运行安装依赖：starlette / uvicorn / httpx / PyYAML
+pip install -r requirements.txt          # 首次运行安装依赖：starlette / uvicorn / httpx / PyYAML / psutil
 python main.py -config ../config.yaml     # -config 指向配置文件（可用相对/绝对路径）
 ```
 
 两种方式默认都监听 `config.yaml` 里的 `server.addr`（缺省 `:8080`），启动日志会列出所有链名与开关状态，例如：
 
 ```
+concurrency limiter enabled: max=200 queue=400 timeout=30s
+[memguard] started: max=1024MB, warn=80%, critical=90%, interval=10s
 auto2api(python) listening, chains: ['cn', 'coding'], breaker: enabled, call_log: True
 health checker enabled: interval=60s timeout=10s
 Uvicorn running on http://0.0.0.0:8686
@@ -65,7 +73,7 @@ Uvicorn running on http://0.0.0.0:8686
 | POST | `/v1/messages` | **Claude（Anthropic Messages API）兼容**，`model` 字段填链名 |
 | POST | `/messages` | 无 `/v1` 前缀的 Claude 兼容路径 |
 | GET  | `/v1/models` | 列出所有链名（OpenAI /v1/models 格式） |
-| GET  | `/v1/health` | 每条链各模型的实时健康：优先级、上游模型、是否冷却中、熔断状态、连续失败数、探活健康、延迟 EMA、成功率、总请求/失败数（无需鉴权） |
+| GET  | `/v1/health` | 每条链各模型的实时健康：优先级、上游模型、是否冷却中、熔断状态、连续失败数、探活健康、延迟 EMA、成功率、总请求/失败数；含 `_protection`（并发数、拒绝/超时数、内存用量、降级状态、异常计数）（无需鉴权） |
 
 ### 调用示例
 
@@ -154,6 +162,19 @@ health_check:
   interval: "60s"               # 探活周期
   timeout: "10s"                # 单次探活请求超时
 
+# 服务保护（可选，Go / Python 均支持；各项值为 0/空即禁用）。防崩溃三板斧：
+#   1. 并发限流：防上游超时导致连接无限堆积
+#   2. 内存守护：防内存泄漏/OOM，超阈值自动降级（Python 版需安装 psutil）
+#   3. 异常恢复：自动启用，捕获未捕获异常防进程退出（无需配置）
+protection:
+  max_concurrent: 200           # 最大并发处理请求数，0=不限制；超出进队列等待
+  max_queue_size: 400           # 等待队列长度，0=自动(2x max_concurrent)；队列满直接 503
+  queue_timeout: "30s"          # 队列等待超时，超时返回 503 + Retry-After
+  max_memory_mb: 1024           # 进程最大允许内存(MB)，0=不监控；建议设为容器上限的 80%
+  memory_warn: 0.8              # 警告阈值(占比)，超过则主动 GC + 告警
+  memory_critical: 0.9          # 临界阈值，超过则拒新请求(503)并强制 GC，回落后自动恢复
+  memory_check_interval: "10s"  # 内存检查周期
+
 chains:
   auto:                       # 链名 = 客户端 model 字段值
     models:                   # 也可省略 models: 直接写模型列表（两种写法均支持）
@@ -198,6 +219,13 @@ chains:
 | `health_check.enabled` | `false` | 主动健康检查总开关 |
 | `health_check.interval` | `30s` | 探活周期 |
 | `health_check.timeout` | `10s` | 单次探活请求超时 |
+| `protection.max_concurrent` | `0`（禁用） | 最大并发请求数 |
+| `protection.max_queue_size` | `2x concurrent` | 等待队列长度 |
+| `protection.queue_timeout` | `30s` | 队列等待超时 |
+| `protection.max_memory_mb` | `0`（禁用） | 进程最大允许内存(MB)，Python 版需 psutil |
+| `protection.memory_warn` | `0.8` | 内存警告阈值(占比) |
+| `protection.memory_critical` | `0.9` | 内存临界阈值(占比) |
+| `protection.memory_check_interval` | `10s` | 内存检查周期 |
 | `upstream.timeout` | `120s` | 上游请求超时 |
 | `upstream.auth_header` | `Authorization` | 鉴权头类型 |
 | `failover.cooldown` | `60s` | 失败模型冷却时长 |
@@ -252,11 +280,14 @@ auto2api/
 │       ├── breaker.go             # 熔断器三态机
 │       ├── metrics.go             # EMA 延迟/成功率指标
 │       ├── healthcheck.go         # 后台主动探活
+│       ├── limiter.go             # 并发限流器（令牌桶 + 等待队列）
+│       ├── memguard.go            # 内存守护（周期检测 + 自动降级 + GC）
+│       ├── recovery.go            # panic recovery 中间件
 │       └── call_logger.go         # 按日期轮转调用日志 + 响应录制
 │
 └── python/                        # —— Python 实现（与 Go 功能对齐，完全独立）——
     ├── main.py                    # Python 入口：uvicorn + Starlette
-    ├── requirements.txt           # starlette / uvicorn / httpx / PyYAML
+    ├── requirements.txt           # starlette / uvicorn / httpx / PyYAML / psutil
     └── auto2api/
         ├── config.py              # YAML 解析、默认值、${ENV} 展开、时长解析
         ├── handler.py             # 路由 + 两级 fallback 编排 + 调用日志
@@ -266,6 +297,9 @@ auto2api/
         ├── breaker.py             # 熔断器三态机
         ├── metrics.py             # EMA 延迟/成功率指标
         ├── healthcheck.py         # 后台主动探活（asyncio）
+        ├── limiter.py             # 并发限流器（asyncio 信号量 + 等待队列）
+        ├── memguard.py            # 内存守护（asyncio 后台任务 + 降级 + GC）
+        ├── recovery.py            # 异常恢复中间件（Starlette）
         ├── call_logger.py         # 按日期轮转调用日志 + 响应录制
         └── server.py              # Starlette 应用装配、路由注册、生命周期
 ```
@@ -287,10 +321,19 @@ auto2api/
 - `http.Client.Timeout=0`：流式安全，由请求级 `context.WithTimeout` 控制截止
 - `BodyCommitted` 标记：流式中途失败时响应体已写，不可再 fallback，直接结束
 - 单行 64MB 缓冲：`bufio.Scanner` 容纳上游长行 SSE
+- **并发限流**用带缓冲 channel 作信号量（令牌桶），`Acquire/Release` 无轮询、无 goroutine 泄漏；等待队列超限或超时快速失败
+- **内存守护**后台 goroutine 读 `runtime.MemStats.Alloc`，用原子标志无锁判断降级状态，降级中 `AllowRequest` 直接拒绝
+- **panic recovery** 自定义中间件替代 `gin.Recovery()`，记录 `debug.Stack()` 全量堆栈并累加计数
+- **优雅关闭**用 `http.Server.Shutdown(ctx)` + 信号监听，关闭时同步停止内存守护与健康检查后台任务
+- **连接池**自定义 `http.Transport`：`MaxConnsPerHost=100`、`MaxIdleConnsPerHost=50`、`IdleConnTimeout=90s`
 
 **Python 版**
 
 - 基于 `Starlette + uvicorn + httpx`（asyncio）
 - 转发用 `httpx.stream(...)` 先拿状态码：非 2xx 仍可 fallback，2xx 才提交响应体（等价于 Go 的 `BodyCommitted` 语义）
-- 共享 `httpx.AsyncClient`，并在事件循环变化时惰性重建连接池
+- 共享 `httpx.AsyncClient`，并在事件循环变化时惰性重建连接池；连接池上限 `max_connections=100`、`max_keepalive_connections=50`、`keepalive_expiry=90s`
 - 健康检查为 asyncio 后台任务，随应用 `on_startup/on_shutdown` 生命周期启停
+- **并发限流**用 `asyncio.Semaphore` 作令牌桶 + `waiting` 计数控制队列上限，`asyncio.wait_for` 实现等待超时；流式请求的槽位释放挂在响应 `BackgroundTask`，确保推流完毕后才释放
+- **内存守护**后台 asyncio 任务读进程 RSS（优先 `psutil`，未安装则自动禁用），超阈值 `gc.collect()` + 降级标志拒新请求
+- **异常恢复**用 Starlette `BaseHTTPMiddleware` 捕获未处理异常，记录 `traceback` 全量堆栈并累加计数
+- **优雅关闭**依赖 uvicorn 的信号处理 + `on_shutdown` 钩子，停止内存守护/健康检查任务并关闭连接池

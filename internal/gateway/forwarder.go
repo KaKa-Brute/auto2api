@@ -38,7 +38,19 @@ type Forwarder struct {
 }
 
 func NewForwarder(logger *CallLogger) *Forwarder {
-	return &Forwarder{client: &http.Client{Timeout: 0}, logger: logger}
+	// 自定义 Transport：限制连接池上限，防止上游超时导致连接无上限堆积。
+	// Timeout=0 保留（流式安全），由请求级 context 控制截止。
+	transport := &http.Transport{
+		MaxIdleConns:          200,              // 全局最大空闲连接
+		MaxIdleConnsPerHost:   50,               // 每个上游最大空闲连接
+		MaxConnsPerHost:       100,              // 每个上游最大连接数（含活跃），超出则阻塞等待
+		IdleConnTimeout:       90 * time.Second, // 空闲连接回收，避免连接泄漏
+		TLSHandshakeTimeout:   10 * time.Second, // TLS 握手超时，防握手挂起
+		ExpectContinueTimeout: 1 * time.Second,
+		ResponseHeaderTimeout: 0, // 由请求级 context 控制，流式不设限
+		ForceAttemptHTTP2:     true,
+	}
+	return &Forwarder{client: &http.Client{Timeout: 0, Transport: transport}, logger: logger}
 }
 
 // allowedHeaders 是从客户端透传到上游的头部白名单（小写），其余一律丢弃。

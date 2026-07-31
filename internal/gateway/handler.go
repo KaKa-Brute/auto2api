@@ -21,6 +21,8 @@ type Handler struct {
 	maxSwitches int
 	apiKeys     map[string]bool // 已授权 key 集合，为空则不鉴权
 	logger      *CallLogger
+	limiter     *ConcurrencyLimiter // 并发限流器（可选，nil=不限流）
+	memGuard    *MemoryGuard        // 内存守护（可选，nil=不监控）
 }
 
 func NewHandler(s *Scheduler, f *Forwarder, maxSwitches int, apiKeys []string, logger *CallLogger) *Handler {
@@ -36,17 +38,57 @@ func NewHandler(s *Scheduler, f *Forwarder, maxSwitches int, apiKeys []string, l
 	return h
 }
 
+// SetProtection 注入并发限流器与内存守护（由 main 构造后注入）。
+func (h *Handler) SetProtection(limiter *ConcurrencyLimiter, memGuard *MemoryGuard) {
+	h.limiter = limiter
+	h.memGuard = memGuard
+}
+
 // Register 把路由挂到 gin 引擎上（OpenAI 兼容 + Claude 兼容）。
 func (h *Handler) Register(r *gin.Engine) {
 	auth := h.authMiddleware()
-	// OpenAI 兼容端点
-	r.POST("/v1/chat/completions", auth, h.ChatCompletions)
-	r.POST("/chat/completions", auth, h.ChatCompletions) // 无 /v1 前缀的客户端兼容
-	// Claude（Anthropic Messages API）兼容端点
-	r.POST("/v1/messages", auth, h.Messages)
-	r.POST("/messages", auth, h.Messages) // 无 /v1 前缀兼容
+	protect := h.protectionMiddleware() // 内存降级 + 并发限流
+	// OpenAI 兼容端点（受保护）
+	r.POST("/v1/chat/completions", protect, auth, h.ChatCompletions)
+	r.POST("/chat/completions", protect, auth, h.ChatCompletions) // 无 /v1 前缀的客户端兼容
+	// Claude（Anthropic Messages API）兼容端点（受保护）
+	r.POST("/v1/messages", protect, auth, h.Messages)
+	r.POST("/messages", protect, auth, h.Messages) // 无 /v1 前缀兼容
 	r.GET("/v1/models", auth, h.Models)
 	r.GET("/v1/health", h.Health) // 健康检查不鉴权，方便监控探活
+}
+
+// protectionMiddleware 组合内存降级检查与并发限流：
+//   1. 内存降级：内存超临界阈值时直接拒绝（503），给 GC 时间回收，防 OOM
+//   2. 并发限流：并发超限时排队等待，队列满或超时则拒绝（503），防连接堆积
+// 未配置对应机制时自动跳过（nil 检查）。
+func (h *Handler) protectionMiddleware() gin.HandlerFunc {
+	return func(c *gin.Context) {
+		// 标记出站格式，使错误按正确格式返回
+		if strings.Contains(c.Request.URL.Path, "/messages") {
+			c.Set("outbound_format", "claude")
+		}
+		// 层 1：内存降级检查
+		if h.memGuard != nil {
+			if allowed, reason := h.memGuard.AllowRequest(); !allowed {
+				c.Header("Retry-After", "5")
+				writeJSONError(c, http.StatusServiceUnavailable, "overloaded_error", "server overloaded: "+reason)
+				c.Abort()
+				return
+			}
+		}
+		// 层 2：并发限流
+		if h.limiter != nil {
+			if err := h.limiter.Acquire(c.Request.Context()); err != nil {
+				c.Header("Retry-After", "3")
+				writeJSONError(c, http.StatusServiceUnavailable, "overloaded_error", "too many concurrent requests: "+err.Error())
+				c.Abort()
+				return
+			}
+			defer h.limiter.Release()
+		}
+		c.Next()
+	}
 }
 
 // authMiddleware 校验客户端 Authorization: Bearer <key> / x-api-key。
@@ -381,6 +423,25 @@ func (h *Handler) Health(c *gin.Context) {
 		}
 		out[name] = models
 	}
+	// 服务保护运行时状态（并发/内存/panic），供监控告警
+	protection := gin.H{"total_panics": GetPanicStats()}
+	if h.limiter != nil {
+		cur, rejected, timeout := h.limiter.Stats()
+		protection["concurrency"] = gin.H{
+			"current":        cur,
+			"total_rejected": rejected,
+			"total_timeout":  timeout,
+		}
+	}
+	if h.memGuard != nil {
+		usedMB, degraded, rejected := h.memGuard.Stats()
+		protection["memory"] = gin.H{
+			"used_mb":        usedMB,
+			"degraded":       degraded,
+			"total_rejected": rejected,
+		}
+	}
+	out["_protection"] = protection
 	c.JSON(http.StatusOK, out)
 }
 

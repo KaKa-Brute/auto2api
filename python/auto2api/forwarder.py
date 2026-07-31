@@ -105,10 +105,20 @@ class Forwarder:
         self._client_loop = None
 
     def _get_client(self) -> httpx.AsyncClient:
-        """惰性创建 httpx client，并在事件循环变化时重建（连接池绑定 loop）。"""
+        """惰性创建 httpx client，并在事件循环变化时重建（连接池绑定 loop）。
+
+        限制连接池上限，防止上游超时导致连接无限堆积撑爆内存/句柄。
+        对齐 Go 版 forwarder 的 http.Transport 连接池配置。
+        """
         loop = asyncio.get_event_loop()
         if self._client is None or self._client_loop is not loop:
-            self._client = httpx.AsyncClient(timeout=None, follow_redirects=True)
+            limits = httpx.Limits(
+                max_connections=100,            # 全局最大连接数
+                max_keepalive_connections=50,   # 最大保活连接数
+                keepalive_expiry=90.0,          # 保活连接空闲回收（秒）
+            )
+            self._client = httpx.AsyncClient(timeout=None, follow_redirects=True,
+                                             limits=limits)
             self._client_loop = loop
         return self._client
 

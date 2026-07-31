@@ -18,6 +18,7 @@ type Config struct {
 	Log         LogConfig               `yaml:"log"`
 	Breaker     BreakerConfig           `yaml:"breaker"`
 	HealthCheck HealthCheckConfig       `yaml:"health_check"`
+	Protection  ProtectionConfig        `yaml:"protection"` // 新增：服务保护配置
 	Chains      map[string]ChainConfig `yaml:"chains"`
 }
 
@@ -97,6 +98,22 @@ type HealthCheckConfig struct {
 	Enabled  bool   `yaml:"enabled"`           // 总开关
 	Interval string `yaml:"interval"`          // 探活周期（如 "30s"）
 	Timeout  string `yaml:"timeout"`           // 单次探活请求超时（如 "10s"）
+}
+
+// ProtectionConfig 服务保护配置（防崩溃三板斧）。
+type ProtectionConfig struct {
+	// 并发限流：防止上游 API 超时导致连接堆积
+	MaxConcurrent  int    `yaml:"max_concurrent"`   // 最大并发请求数，0=不限制
+	MaxQueueSize   int    `yaml:"max_queue_size"`   // 等待队列长度，0=auto(2x concurrent)
+	QueueTimeout   string `yaml:"queue_timeout"`    // 队列等待超时（如 "30s"）
+	
+	// 内存守护：防止内存泄漏或 OOM
+	MaxMemoryMB     int64   `yaml:"max_memory_mb"`     // 最大允许内存（MB），0=不限制
+	MemoryWarn      float64 `yaml:"memory_warn"`       // 警告阈值（0.8 = 80%）
+	MemoryCritical  float64 `yaml:"memory_critical"`   // 临界阈值（0.9 = 90%），超过后拒绝请求
+	MemoryCheckInterval string `yaml:"memory_check_interval"` // 检查周期（如 "10s"）
+	
+	// panic recovery 自动启用，无需配置
 }
 
 var envRe = regexp.MustCompile(`\$\{([A-Z0-9_]+)\}`)
@@ -183,6 +200,32 @@ func Load(path string) (*Config, error) {
 		}
 		if _, err := time.ParseDuration(c.HealthCheck.Timeout); err != nil {
 			return nil, fmt.Errorf("health_check.timeout: %w", err)
+		}
+	}
+	// 服务保护默认值与校验
+	if c.Protection.MaxConcurrent > 0 {
+		if c.Protection.MaxQueueSize <= 0 {
+			c.Protection.MaxQueueSize = c.Protection.MaxConcurrent * 2
+		}
+		if c.Protection.QueueTimeout == "" {
+			c.Protection.QueueTimeout = "30s"
+		}
+		if _, err := time.ParseDuration(c.Protection.QueueTimeout); err != nil {
+			return nil, fmt.Errorf("protection.queue_timeout: %w", err)
+		}
+	}
+	if c.Protection.MaxMemoryMB > 0 {
+		if c.Protection.MemoryWarn <= 0 || c.Protection.MemoryWarn > 1 {
+			c.Protection.MemoryWarn = 0.8
+		}
+		if c.Protection.MemoryCritical <= 0 || c.Protection.MemoryCritical > 1 {
+			c.Protection.MemoryCritical = 0.9
+		}
+		if c.Protection.MemoryCheckInterval == "" {
+			c.Protection.MemoryCheckInterval = "10s"
+		}
+		if _, err := time.ParseDuration(c.Protection.MemoryCheckInterval); err != nil {
+			return nil, fmt.Errorf("protection.memory_check_interval: %w", err)
 		}
 	}
 	// 展开 ${ENV} 并去空
