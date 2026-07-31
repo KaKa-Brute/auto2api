@@ -275,6 +275,13 @@ func convertContentBlocks(blocks []interface{}) []interface{} {
 					"image_url": map[string]interface{}{"url": url},
 				})
 			}
+		case "video":
+			if url := claudeVideoToOpenAIURL(m["source"]); url != "" {
+				out = append(out, map[string]interface{}{
+					"type":      "video_url",
+					"video_url": map[string]interface{}{"url": url},
+				})
+			}
 		default:
 			// 未知块原样透传（尽力兼容）
 			out = append(out, b)
@@ -299,6 +306,28 @@ func claudeImageToOpenAIURL(src interface{}) string {
 		data, _ := m["data"].(string)
 		if media == "" {
 			media = "image/png"
+		}
+		return "data:" + media + ";base64," + data
+	}
+	return ""
+}
+
+// claudeVideoToOpenAIURL 把 Claude video source 转成 OpenAI video_url.url。
+func claudeVideoToOpenAIURL(src interface{}) string {
+	m, ok := src.(map[string]interface{})
+	if !ok {
+		return ""
+	}
+	st, _ := m["type"].(string)
+	switch st {
+	case "url":
+		u, _ := m["url"].(string)
+		return u
+	case "base64":
+		media, _ := m["media_type"].(string)
+		data, _ := m["data"].(string)
+		if media == "" {
+			media = "video/mp4"
 		}
 		return "data:" + media + ";base64," + data
 	}

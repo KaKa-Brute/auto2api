@@ -191,6 +191,10 @@ def _convert_content_blocks(blocks: List[Any]) -> List[Any]:
             url = _claude_image_to_openai_url(b.get("source"))
             if url:
                 out.append({"type": "image_url", "image_url": {"url": url}})
+        elif t == "video":
+            url = _claude_video_to_openai_url(b.get("source"))
+            if url:
+                out.append({"type": "video_url", "video_url": {"url": url}})
         else:
             out.append(b)  # 未知块原样透传
     return out
@@ -204,6 +208,19 @@ def _claude_image_to_openai_url(src: Any) -> str:
         return src.get("url") or ""
     if st == "base64":
         media = src.get("media_type") or "image/png"
+        data = src.get("data") or ""
+        return f"data:{media};base64,{data}"
+    return ""
+
+
+def _claude_video_to_openai_url(src: Any) -> str:
+    if not isinstance(src, dict):
+        return ""
+    st = src.get("type")
+    if st == "url":
+        return src.get("url") or ""
+    if st == "base64":
+        media = src.get("media_type") or "video/mp4"
         data = src.get("data") or ""
         return f"data:{media};base64,{data}"
     return ""
