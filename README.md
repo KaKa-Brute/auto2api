@@ -34,20 +34,20 @@
 
 本项目提供 **Go** 和 **Python** 两套功能完全对齐、彼此独立的实现，共用同一份 `config.yaml`。服务器上装了哪个运行时就用哪个启动，二者互不依赖。
 
-### 方式一：Go 模式（无需安装 Python）
-
-```bash
-go run . -config config.yaml
-# 或编译后运行
-go build -o auto2api . && ./auto2api -config config.yaml
-```
-
-### 方式二：Python 模式（无需安装 Go）
+### 方式一：Python 模式（默认，无需安装 Go）
 
 ```bash
 cd python
 pip install -r requirements.txt          # 首次运行安装依赖：starlette / uvicorn / httpx / PyYAML / psutil
 python main.py -config ../config.yaml     # -config 指向配置文件（可用相对/绝对路径）
+```
+
+### 方式二：Go 模式（无需安装 Python）
+
+```bash
+go run . -config config.yaml
+# 或编译后运行
+go build -o auto2api . && ./auto2api -config config.yaml
 ```
 
 两种方式默认都监听 `config.yaml` 里的 `server.addr`（缺省 `:8080`），启动日志会列出所有链名与开关状态，例如：
