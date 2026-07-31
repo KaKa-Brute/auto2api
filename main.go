@@ -54,13 +54,13 @@ func main() {
 	// 服务保护：并发限流 + 内存守护
 	var limiter *gateway.ConcurrencyLimiter
 	var memGuard *gateway.MemoryGuard
-	if cfg.Protection.MaxConcurrent > 0 {
+	if cfg.Protection.Enabled && cfg.Protection.MaxConcurrent > 0 {
 		qt, _ := time.ParseDuration(cfg.Protection.QueueTimeout)
 		limiter = gateway.NewConcurrencyLimiter(cfg.Protection.MaxConcurrent, cfg.Protection.MaxQueueSize, qt)
 		log.Printf("concurrency limiter enabled: max=%d queue=%d timeout=%s",
 			cfg.Protection.MaxConcurrent, cfg.Protection.MaxQueueSize, cfg.Protection.QueueTimeout)
 	}
-	if cfg.Protection.MaxMemoryMB > 0 {
+	if cfg.Protection.Enabled && cfg.Protection.MaxMemoryMB > 0 {
 		ci, _ := time.ParseDuration(cfg.Protection.MemoryCheckInterval)
 		memGuard = gateway.NewMemoryGuard(cfg.Protection.MaxMemoryMB, cfg.Protection.MemoryWarn, cfg.Protection.MemoryCritical, ci)
 		memGuard.Start()

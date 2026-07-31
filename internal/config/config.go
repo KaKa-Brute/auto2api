@@ -102,6 +102,8 @@ type HealthCheckConfig struct {
 
 // ProtectionConfig 服务保护配置（防崩溃三板斧）。
 type ProtectionConfig struct {
+	Enabled bool `yaml:"enabled"` // 总开关，默认关闭；关闭时不启用并发限流与内存守护
+
 	// 并发限流：防止上游 API 超时导致连接堆积
 	MaxConcurrent  int    `yaml:"max_concurrent"`   // 最大并发请求数，0=不限制
 	MaxQueueSize   int    `yaml:"max_queue_size"`   // 等待队列长度，0=auto(2x concurrent)
@@ -202,8 +204,8 @@ func Load(path string) (*Config, error) {
 			return nil, fmt.Errorf("health_check.timeout: %w", err)
 		}
 	}
-	// 服务保护默认值与校验
-	if c.Protection.MaxConcurrent > 0 {
+	// 服务保护默认值与校验（总开关关闭时整体禁用）
+	if c.Protection.Enabled && c.Protection.MaxConcurrent > 0 {
 		if c.Protection.MaxQueueSize <= 0 {
 			c.Protection.MaxQueueSize = c.Protection.MaxConcurrent * 2
 		}
@@ -214,7 +216,7 @@ func Load(path string) (*Config, error) {
 			return nil, fmt.Errorf("protection.queue_timeout: %w", err)
 		}
 	}
-	if c.Protection.MaxMemoryMB > 0 {
+	if c.Protection.Enabled && c.Protection.MaxMemoryMB > 0 {
 		if c.Protection.MemoryWarn <= 0 || c.Protection.MemoryWarn > 1 {
 			c.Protection.MemoryWarn = 0.8
 		}

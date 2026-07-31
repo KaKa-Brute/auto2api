@@ -162,11 +162,12 @@ health_check:
   interval: "60s"               # 探活周期
   timeout: "10s"                # 单次探活请求超时
 
-# 服务保护（可选，Go / Python 均支持；各项值为 0/空即禁用）。防崩溃三板斧：
+# 服务保护（可选，Go / Python 均支持，默认关闭）。总开关 enabled 关闭时下列功能均不启用。防崩溃三板斧：
 #   1. 并发限流：防上游超时导致连接无限堆积
 #   2. 内存守护：防内存泄漏/OOM，超阈值自动降级（Python 版需安装 psutil）
 #   3. 异常恢复：自动启用，捕获未捕获异常防进程退出（无需配置）
 protection:
+  enabled: false                # 总开关，默认关闭；置 true 才启用并发限流与内存守护
   max_concurrent: 200           # 最大并发处理请求数，0=不限制；超出进队列等待
   max_queue_size: 400           # 等待队列长度，0=自动(2x max_concurrent)；队列满直接 503
   queue_timeout: "30s"          # 队列等待超时，超时返回 503 + Retry-After
@@ -219,6 +220,7 @@ chains:
 | `health_check.enabled` | `false` | 主动健康检查总开关 |
 | `health_check.interval` | `30s` | 探活周期 |
 | `health_check.timeout` | `10s` | 单次探活请求超时 |
+| `protection.enabled` | `false` | 服务保护总开关，关闭则并发限流与内存守护均不启用 |
 | `protection.max_concurrent` | `0`（禁用） | 最大并发请求数 |
 | `protection.max_queue_size` | `2x concurrent` | 等待队列长度 |
 | `protection.queue_timeout` | `30s` | 队列等待超时 |

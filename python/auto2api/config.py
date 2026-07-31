@@ -130,6 +130,7 @@ class HealthCheckConfig:
 @dataclass
 class ProtectionConfig:
     """服务保护配置（防崩溃三板斧）。对齐 Go 版 ProtectionConfig。"""
+    enabled: bool = False          # 总开关，默认关闭；关闭时不启用并发限流与内存守护
     # 并发限流：防止上游 API 超时导致连接堆积
     max_concurrent: int = 0        # 最大并发请求数，0=不限制
     max_queue_size: int = 0        # 等待队列长度，0=auto(2x concurrent)
@@ -222,6 +223,7 @@ def load(path: str) -> Config:
     )
     pr = raw.get("protection", {}) or {}
     protection = ProtectionConfig(
+        enabled=bool(pr.get("enabled", False)),
         max_concurrent=int(pr.get("max_concurrent", 0) or 0),
         max_queue_size=int(pr.get("max_queue_size", 0) or 0),
         queue_timeout=pr.get("queue_timeout", "") or "",
@@ -264,14 +266,14 @@ def load(path: str) -> Config:
         if not cfg.health_check.timeout:
             cfg.health_check.timeout = "10s"
         parse_duration(cfg.health_check.timeout)
-    # 服务保护默认值与校验
-    if cfg.protection.max_concurrent > 0:
+    # 服务保护默认值与校验（总开关关闭时整体禁用）
+    if cfg.protection.enabled and cfg.protection.max_concurrent > 0:
         if cfg.protection.max_queue_size <= 0:
             cfg.protection.max_queue_size = cfg.protection.max_concurrent * 2
         if not cfg.protection.queue_timeout:
             cfg.protection.queue_timeout = "30s"
         parse_duration(cfg.protection.queue_timeout)
-    if cfg.protection.max_memory_mb > 0:
+    if cfg.protection.enabled and cfg.protection.max_memory_mb > 0:
         if cfg.protection.memory_warn <= 0 or cfg.protection.memory_warn > 1:
             cfg.protection.memory_warn = 0.8
         if cfg.protection.memory_critical <= 0 or cfg.protection.memory_critical > 1:

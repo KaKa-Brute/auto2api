@@ -46,7 +46,7 @@ def build_app(cfg: cfgmod.Config) -> Starlette:
 
     # 服务保护：并发限流 + 内存守护（防崩溃三板斧之二，第三为 recovery 中间件）
     limiter = None
-    if cfg.protection.max_concurrent > 0:
+    if cfg.protection.enabled and cfg.protection.max_concurrent > 0:
         qt = cfgmod.parse_duration(cfg.protection.queue_timeout)
         limiter = create_limiter(cfg.protection.max_concurrent,
                                  cfg.protection.max_queue_size, qt)
@@ -54,7 +54,7 @@ def build_app(cfg: cfgmod.Config) -> Starlette:
                   cfg.protection.max_concurrent, cfg.protection.max_queue_size,
                   cfg.protection.queue_timeout)
     memguard = None
-    if cfg.protection.max_memory_mb > 0:
+    if cfg.protection.enabled and cfg.protection.max_memory_mb > 0:
         ci = cfgmod.parse_duration(cfg.protection.memory_check_interval)
         memguard = create_memguard(cfg.protection.max_memory_mb,
                                    cfg.protection.memory_warn,
