@@ -125,6 +125,27 @@ func (b *CircuitBreaker) State() breakerState {
 	return b.state
 }
 
+// ShouldSkipRouting 判断路由选路时是否应跳过该模型（只读，不改状态）。
+// 仅当熔断处于 OPEN 且冷却窗口未到期时才跳过；OPEN 已到期则不跳过——
+// 让该模型重新成为候选，由后续 Allow 触发 OPEN→HALF_OPEN 并放行一个探测请求。
+//
+// 这是修复“熔断 OPEN 后永久 OPEN”的关键：此前选路用 State()==OPEN 直接跳过，
+// 而唯一能触发 HALF_OPEN 探测的 Allow 只在被选中的模型上调用，被跳过的模型
+// 永远得不到探测，只能重启进程复位。改用本方法后，到期的 OPEN 模型会被重新
+// 纳入候选并获得探测机会。
+func (b *CircuitBreaker) ShouldSkipRouting() bool {
+	if !b.cfg.Enabled {
+		return false
+	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.state != breakerOpen {
+		return false
+	}
+	// OPEN 且冷却未到期 → 跳过；已到期 → 不跳过（放行探测）。
+	return time.Since(b.openedAt) < b.cfg.OpenDuration
+}
+
 // StateName 返回状态名字符串，供 /v1/health 展示。
 func (b *CircuitBreaker) StateName() string {
 	switch b.State() {

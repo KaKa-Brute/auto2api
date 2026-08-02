@@ -332,7 +332,9 @@ func (s *Scheduler) PickNext(chain *Chain, excluded map[string]bool) *Model {
 		if exp, ok := s.cooldown[m.cooldownKey()]; ok && now.Before(exp) {
 			continue
 		}
-		if b := s.breakers[m.cooldownKey()]; b != nil && b.State() == breakerOpen {
+		// 仅跳过冷却未到期的 OPEN 熔断器；到期的 OPEN 保留为候选，
+		// 以便后续 AllowRequest 触发 OPEN→HALF_OPEN 探测恢复。
+		if b := s.breakers[m.cooldownKey()]; b != nil && b.ShouldSkipRouting() {
 			continue
 		}
 		return m
@@ -364,7 +366,9 @@ func (s *Scheduler) SelectModel(chain *Chain, excluded map[string]bool) *Model {
 		if exp, ok := s.cooldown[m.cooldownKey()]; ok && now.Before(exp) {
 			continue
 		}
-		if b := s.breakers[m.cooldownKey()]; b != nil && b.State() == breakerOpen {
+		// 仅跳过冷却未到期的 OPEN 熔断器；到期的 OPEN 保留为候选，
+		// 以便后续 AllowRequest 触发 OPEN→HALF_OPEN 探测恢复。
+		if b := s.breakers[m.cooldownKey()]; b != nil && b.ShouldSkipRouting() {
 			continue
 		}
 		c := cand{m: m, latency: 0, success: 1.0, healthy: 0}

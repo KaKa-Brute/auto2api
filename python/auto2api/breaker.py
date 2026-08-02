@@ -91,6 +91,24 @@ class CircuitBreaker:
         with self._lock:
             return self._state
 
+    def should_skip_routing(self) -> bool:
+        """路由选路时是否应跳过该模型（只读，不改状态）。
+
+        仅当熔断处于 OPEN 且冷却窗口未到期时才跳过；OPEN 已到期则不跳过——
+        让该模型重新成为候选，由后续 allow 触发 OPEN→HALF_OPEN 并放行一个探测请求。
+
+        修复“熔断 OPEN 后永久 OPEN”的关键：此前选路用 state()==OPEN 直接跳过，
+        而唯一能触发 HALF_OPEN 探测的 allow 只在被选中的模型上调用，被跳过的模型
+        永远得不到探测，只能重启进程复位。改用本方法后，到期的 OPEN 模型会被重新
+        纳入候选并获得探测机会。
+        """
+        if not self._cfg.enabled:
+            return False
+        with self._lock:
+            if self._state != BREAKER_OPEN:
+                return False
+            return time.monotonic() - self._opened_at < self._cfg.open_duration
+
     def state_name(self) -> str:
         s = self.state()
         return {BREAKER_CLOSED: "closed", BREAKER_OPEN: "open",

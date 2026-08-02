@@ -201,8 +201,10 @@ class Scheduler:
                 exp = self._cooldown.get(m.cooldown_key())
                 if exp is not None and now < exp:
                     continue
+                # 仅跳过冷却未到期的 OPEN 熔断器；到期的 OPEN 保留为候选，
+                # 以便后续 allow_request 触发 OPEN→HALF_OPEN 探测恢复。
                 b = self._breakers.get(m.cooldown_key())
-                if b is not None and b.state() == BREAKER_OPEN:
+                if b is not None and b.should_skip_routing():
                     continue
                 return m
             return None
@@ -218,8 +220,10 @@ class Scheduler:
                 exp = self._cooldown.get(m.cooldown_key())
                 if exp is not None and now < exp:
                     continue
+                # 仅跳过冷却未到期的 OPEN 熔断器；到期的 OPEN 保留为候选，
+                # 以便后续 allow_request 触发 OPEN→HALF_OPEN 探测恢复。
                 b = self._breakers.get(m.cooldown_key())
-                if b is not None and b.state() == BREAKER_OPEN:
+                if b is not None and b.should_skip_routing():
                     continue
                 latency, success, healthy = 0.0, 1.0, 0
                 mt = self._metrics.get(m.cooldown_key())
