@@ -4,15 +4,19 @@
 //   1. 并发限流：防上游超时导致连接堆积
 //   2. 内存守护：防内存泄漏/OOM，超阈值自动降级
 //   3. panic recovery：防未捕获异常导致进程退出
+// 内置可视化管理台（/chat，免鉴权）：编辑配置、重启服务、查看日志。
 package main
 
 import (
 	"context"
 	"flag"
 	"log"
+	"net"
 	"net/http"
 	"os"
+	"os/exec"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
@@ -75,26 +79,59 @@ func main() {
 	r.Use(gateway.RecoveryMiddleware())
 	h.Register(r)
 
+	// 可视化管理台（/chat，免鉴权）：编辑配置、重启服务、查看日志。
+	// restartRequested 用于让重启回调通知主循环执行“启动新进程 + 优雅退出”。
+	restartRequested := make(chan struct{}, 1)
+	restartFn := func() error {
+		select {
+		case restartRequested <- struct{}{}:
+		default: // 已在重启中
+		}
+		return nil
+	}
+	admin := gateway.NewAdminHandler(*cfgPath, cfg.Log.Dir, restartFn)
+	admin.Register(r)
+
 	breakerStatus := "disabled"
 	if cfg.Breaker.Enabled {
 		breakerStatus = "enabled"
 	}
-	log.Printf("auto2api listening on %s, chains: %v, breaker: %s, call_log: %v",
+	log.Printf("auto2api listening on %s, chains: %v, breaker: %s, call_log: %v, admin: /chat",
 		cfg.Server.Addr, sched.ListChains(), breakerStatus, logger.Enabled())
 
-	// HTTP server + 优雅关闭：收到 SIGINT/SIGTERM 时停止接收新请求，
+	// 监听端口：带重试，便于重启时等待旧进程释放端口。
+	ln, err := listenWithRetry(cfg.Server.Addr, 10*time.Second)
+	if err != nil {
+		log.Fatalf("listen %s: %v", cfg.Server.Addr, err)
+	}
+
+	// HTTP server + 优雅关闭：收到 SIGINT/SIGTERM 或重启请求时停止接收新请求，
 	// 等待在途请求完成（最多 30s），并停止后台 goroutine。
-	srv := &http.Server{Addr: cfg.Server.Addr, Handler: r}
+	srv := &http.Server{Handler: r}
 	go func() {
-		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+		if err := srv.Serve(ln); err != nil && err != http.ErrServerClosed {
 			log.Fatalf("server: %v", err)
 		}
 	}()
 
 	quit := make(chan os.Signal, 1)
 	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
-	<-quit
-	log.Println("shutting down gracefully...")
+
+	restarting := false
+	select {
+	case <-quit:
+		log.Println("shutting down gracefully...")
+	case <-restartRequested:
+		restarting = true
+		log.Println("restart requested, spawning new process...")
+		if err := spawnSelf(); err != nil {
+			log.Printf("spawn new process failed: %v (aborting restart, keep running)", err)
+			// 启动失败则不退出，继续等待信号，避免服务中断
+			<-quit
+			restarting = false
+			log.Println("shutting down gracefully...")
+		}
+	}
 
 	if memGuard != nil {
 		memGuard.Stop()
@@ -107,5 +144,53 @@ func main() {
 	if err := srv.Shutdown(ctx); err != nil {
 		log.Printf("forced shutdown: %v", err)
 	}
-	log.Println("server stopped")
+	if restarting {
+		log.Println("old process stopped, new process is taking over")
+	} else {
+		log.Println("server stopped")
+	}
+}
+
+// listenWithRetry 在指定地址监听，若端口被占用则重试直到超时。
+// 用于服务重启时新进程等待旧进程释放端口。
+func listenWithRetry(addr string, timeout time.Duration) (net.Listener, error) {
+	deadline := time.Now().Add(timeout)
+	for {
+		ln, err := net.Listen("tcp", addr)
+		if err == nil {
+			return ln, nil
+		}
+		if !isAddrInUse(err) || time.Now().After(deadline) {
+			return nil, err
+		}
+		log.Printf("port %s busy, waiting for previous instance to release...", addr)
+		time.Sleep(300 * time.Millisecond)
+	}
+}
+
+// isAddrInUse 判断错误是否为“端口被占用”。
+func isAddrInUse(err error) bool {
+	if err == nil {
+		return false
+	}
+	s := strings.ToLower(err.Error())
+	return strings.Contains(s, "address already in use") ||
+		strings.Contains(s, "only one usage of each socket address") || // Windows
+		strings.Contains(s, "in use")
+}
+
+// spawnSelf 以相同可执行文件与参数启动一个新进程（继承标准输入输出与工作目录）。
+// 新进程通过 listenWithRetry 等待本进程释放端口后接管服务。
+func spawnSelf() error {
+	exe, err := os.Executable()
+	if err != nil {
+		return err
+	}
+	cmd := exec.Command(exe, os.Args[1:]...)
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	cmd.Stdin = os.Stdin
+	cmd.Dir, _ = os.Getwd()
+	cmd.Env = os.Environ()
+	return cmd.Start()
 }

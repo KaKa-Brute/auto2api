@@ -8,6 +8,7 @@ from starlette.middleware import Middleware
 from starlette.routing import Route
 
 from . import config as cfgmod
+from .admin import AdminHandler
 from .call_logger import CallLogger
 from .forwarder import Forwarder
 from .handler import Handler
@@ -30,8 +31,11 @@ def parse_addr(addr: str):
     return host, int(port)
 
 
-def build_app(cfg: cfgmod.Config) -> Starlette:
-    """从配置构建 Starlette 应用（含调度器、转发器、日志、健康检查、路由）。"""
+def build_app(cfg: cfgmod.Config, config_path: str = "config.yaml", restart=None) -> Starlette:
+    """从配置构建 Starlette 应用（含调度器、转发器、日志、健康检查、路由）。
+
+    config_path 用于管理台读写配置；restart 为触发服务重启的回调（可为 None）。
+    """
     scheduler = Scheduler(cfg)
     logger = CallLogger(cfg.log.dir, cfg.log.enabled, cfg.log.redact_keys,
                         cfg.log.log_upstream, cfg.log.body_limit,
@@ -78,9 +82,13 @@ def build_app(cfg: cfgmod.Config) -> Starlette:
         Route("/v1/health", handler.health, methods=["GET"]),
     ]
 
+    # 可视化管理台（/chat，免鉴权）：编辑配置、重启服务、查看日志。
+    admin = AdminHandler(config_path, cfg.log.dir, restart)
+    routes.extend(admin.routes())
+
     async def on_startup():
         breaker_status = "enabled" if cfg.breaker.enabled else "disabled"
-        _log.info("auto2api(python) listening, chains: %s, breaker: %s, call_log: %s",
+        _log.info("auto2api(python) listening, chains: %s, breaker: %s, call_log: %s, admin: /chat",
                   scheduler.list_chains(), breaker_status, logger.enabled())
         if health_checker is not None:
             health_checker.start()
