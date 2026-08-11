@@ -36,6 +36,8 @@ class AttemptLog:
     duration_ms: int = 0
     first_token_ms: int = 0
     error: str = ""
+    prompt_tokens: int = 0       # 本次尝试的输入 token
+    completion_tokens: int = 0   # 本次尝试的输出 token
 
     def to_dict(self) -> dict:
         d = {"model": self.model, "priority": self.priority,
@@ -49,6 +51,10 @@ class AttemptLog:
             d["first_token_ms"] = self.first_token_ms
         if self.error:
             d["error"] = self.error
+        if self.prompt_tokens:
+            d["prompt_tokens"] = self.prompt_tokens
+        if self.completion_tokens:
+            d["completion_tokens"] = self.completion_tokens
         return d
 
 
@@ -92,6 +98,8 @@ class CallEntry:
     resp_chunks: int = 0
     duration_ms: int = 0
     error: str = ""
+    prompt_tokens: int = 0       # 本次请求总输入 token
+    completion_tokens: int = 0   # 本次请求总输出 token
 
     start: float = 0.0
     rec: Optional[ResponseRecorder] = None
@@ -119,6 +127,10 @@ class CallEntry:
             d["resp_chunks"] = self.resp_chunks
         if self.error:
             d["error"] = self.error
+        if self.prompt_tokens:
+            d["prompt_tokens"] = self.prompt_tokens
+        if self.completion_tokens:
+            d["completion_tokens"] = self.completion_tokens
         return d
 
 
@@ -212,6 +224,13 @@ class CallLogger:
         if e is None:
             return
         e.attempts.append(a)
+
+    def set_usage(self, e: Optional[CallEntry], prompt: int, completion: int) -> None:
+        """累加本次请求的 token 用量（多次尝试时累加，取最后成功的返回值）。"""
+        if e is None:
+            return
+        e.prompt_tokens = prompt
+        e.completion_tokens = completion
 
     def end(self, e: Optional[CallEntry], status: int, err: Optional[Exception]) -> None:
         if e is None or not self._enabled:

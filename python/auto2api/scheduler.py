@@ -176,6 +176,32 @@ class Scheduler:
         total, fail = mt.total()
         return mt.latency_ema(), mt.success_rate(), total, fail
 
+    def record_tokens(self, m: Model, prompt: int, completion: int) -> None:
+        """累加某模型一次调用的 token 用量到指标器。"""
+        mt = self._metrics_of(m)
+        if mt is not None:
+            mt.record_tokens(prompt, completion)
+
+    def token_stats(self, m: Model):
+        """返回某模型今日的 (累计输入 token, 累计输出 token, 累计总 token)。"""
+        mt = self._metrics_of(m)
+        if mt is None:
+            return 0, 0, 0
+        return mt.tokens()
+
+    def token_stats_for_date(self, m: Model, date: str):
+        """返回某模型指定日期的 token 统计（日期格式 "YYYY-MM-DD"）。"""
+        mt = self._metrics_of(m)
+        if mt is None:
+            return 0, 0, 0
+        return mt.tokens_for_date(date)
+
+    def cleanup_old_tokens(self, keep_days: int) -> None:
+        """清理所有模型中超过指定天数的 token 分片。"""
+        with self._lock:
+            for mt in self._metrics.values():
+                mt.cleanup_old_tokens(keep_days)
+
     def breaker_state_name(self, m: Model) -> str:
         b = self._breaker_of(m.cooldown_key())
         return b.state_name() if b is not None else "closed"

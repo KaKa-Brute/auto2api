@@ -104,6 +104,8 @@ type CallEntry struct {
 	RespChunks int           `json:"resp_chunks,omitempty"` // 流式 SSE 数据块数
 	DurationMs int64         `json:"duration_ms"`
 	Error      string        `json:"error,omitempty"`
+	PromptTokens int         `json:"prompt_tokens,omitempty"` // 本次请求总输入 token
+	CompletionTokens int     `json:"completion_tokens,omitempty"` // 本次请求总输出 token
 
 	start    time.Time
 	rec      *responseRecorder
@@ -120,6 +122,8 @@ type AttemptLog struct {
 	DurationMs int64  `json:"duration_ms"`
 	FirstTokenMs int64 `json:"first_token_ms,omitempty"`
 	Error      string `json:"error,omitempty"`
+	PromptTokens int  `json:"prompt_tokens,omitempty"` // 本次尝试的输入 token
+	CompletionTokens int `json:"completion_tokens,omitempty"` // 本次尝试的输出 token
 }
 
 // Begin 创建一次调用的日志条目，并把 c.Writer 包裹为录制器，
@@ -173,6 +177,15 @@ func (l *CallLogger) AddAttempt(e *CallEntry, a AttemptLog) {
 		return
 	}
 	e.Attempts = append(e.Attempts, a)
+}
+
+// SetUsage 累加本次请求的 token 用量（多次尝试时累加，取最后成功的返回值）。
+func (l *CallLogger) SetUsage(e *CallEntry, prompt, completion int) {
+	if e == nil {
+		return
+	}
+	e.PromptTokens = prompt
+	e.CompletionTokens = completion
 }
 
 // End 结束本次调用日志，落盘。status 为最终响应状态，err 为最终错误（若有）。

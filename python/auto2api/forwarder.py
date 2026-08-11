@@ -34,6 +34,8 @@ class ForwardResult:
         self.upstream_model = ""
         self.first_token_ms = 0
         self.duration_ms = 0
+        self.prompt_tokens = 0      # 本次调用上游返回的输入 token 数（无则 0）
+        self.completion_tokens = 0  # 本次调用上游返回的输出 token 数（无则 0）
 
 
 # 从客户端透传到上游的头部白名单（小写），其余一律丢弃（含 authorization/cookie）。

@@ -268,6 +268,7 @@ class Handler:
             models = []
             for m in ch.models:
                 latency, success, total, fail = self._scheduler.stats(m)
+                prompt_tok, complet_tok, total_tok = self._scheduler.token_stats(m)
                 models.append({
                     "name": m.cfg.name,
                     "priority": m.cfg.priority,
@@ -281,6 +282,9 @@ class Handler:
                     "success_rate": success,
                     "total_requests": total,
                     "total_failures": fail,
+                    "prompt_tokens": prompt_tok,
+                    "completion_tokens": complet_tok,
+                    "total_tokens": total_tok,
                 })
             out[name] = models
         # 服务保护运行时状态（并发/内存/异常计数），供监控告警
@@ -368,11 +372,14 @@ class Handler:
             if out.error is None:
                 # 成功（响应已提交）
                 self._scheduler.record_result(m, res.duration_ms, True)
+                self._scheduler.record_tokens(m, res.prompt_tokens, res.completion_tokens)
                 self._logger.add_attempt(entry, AttemptLog(
                     model=m.cfg.name, priority=m.cfg.priority,
                     upstream_model=res.upstream_model, status=res.status,
                     outcome="success", attempt=attempt,
-                    duration_ms=res.duration_ms, first_token_ms=res.first_token_ms))
+                    duration_ms=res.duration_ms, first_token_ms=res.first_token_ms,
+                    prompt_tokens=res.prompt_tokens, completion_tokens=res.completion_tokens))
+                self._logger.set_usage(entry, res.prompt_tokens, res.completion_tokens)
                 return OUTCOME_SUCCESS, None, out.response
 
             err = out.error

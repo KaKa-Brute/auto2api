@@ -527,10 +527,12 @@ type claudeStreamState struct {
 	messageID              string
 	outputTokens           int
 	inputTokens            int
+	firstTokenMs           int64 // 首 token 相对 begin 的毫秒延迟
 }
 
 // pipeSSEClaude 读上游 OpenAI SSE，逐块转成 Claude SSE 事件写给客户端。
-func pipeSSEClaude(ctx context.Context, c *gin.Context, resp *http.Response, m *Model, begin time.Time) (int64, error) {
+// 转换完成后把 claudeStreamState 维护的 usage 写入 res。
+func pipeSSEClaude(ctx context.Context, c *gin.Context, resp *http.Response, m *Model, begin time.Time, res *ForwardResult) error {
 	defer resp.Body.Close()
 	w := c.Writer
 	w.Header().Set("Content-Type", "text/event-stream")
@@ -568,7 +570,6 @@ func pipeSSEClaude(ctx context.Context, c *gin.Context, resp *http.Response, m *
 		close(lines)
 	}()
 
-	var firstTokenMs int64
 	started := false
 	idle := time.NewTimer(m.IdleTimeout)
 	defer idle.Stop()
@@ -587,7 +588,10 @@ func pipeSSEClaude(ctx context.Context, c *gin.Context, resp *http.Response, m *
 			if !ok {
 				// 上游结束：补完 Claude 终止序列
 				st.finishStream(w, flush)
-				return firstTokenMs, <-errCh
+				res.FirstTokenMs = st.firstTokenMs
+				res.PromptTokens = st.inputTokens
+				res.CompletionTokens = st.outputTokens
+				return <-errCh
 			}
 			line = strings.TrimSpace(line)
 			if line == "" {
@@ -600,14 +604,17 @@ func pipeSSEClaude(ctx context.Context, c *gin.Context, resp *http.Response, m *
 			if payload == "[DONE]" {
 				st.finishStream(w, flush)
 				flush()
-				return firstTokenMs, nil
+				res.FirstTokenMs = st.firstTokenMs
+				res.PromptTokens = st.inputTokens
+				res.CompletionTokens = st.outputTokens
+				return nil
 			}
 			var chunk map[string]interface{}
 			if err := json.Unmarshal([]byte(payload), &chunk); err != nil {
 				continue
 			}
 			if !started {
-				firstTokenMs = ms(time.Since(begin))
+				st.firstTokenMs = ms(time.Since(begin))
 				started = true
 			}
 			if processed := st.handleChunk(w, chunk, flush, writeEvent); processed {
@@ -617,11 +624,11 @@ func pipeSSEClaude(ctx context.Context, c *gin.Context, resp *http.Response, m *
 			fmt.Fprint(w, ": keepalive\n\n")
 			flush()
 		case <-idle.C:
-			return firstTokenMs, fmt.Errorf("stream idle timeout after %s", m.IdleTimeout)
+			return fmt.Errorf("stream idle timeout after %s", m.IdleTimeout)
 		case <-ctx.Done():
-			return firstTokenMs, ctx.Err()
+			return ctx.Err()
 		case <-c.Request.Context().Done():
-			return firstTokenMs, nil
+			return nil
 		}
 	}
 }

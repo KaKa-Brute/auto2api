@@ -37,6 +37,20 @@ def build_app(cfg: cfgmod.Config, config_path: str = "config.yaml", restart=None
     config_path 用于管理台读写配置；restart 为触发服务重启的回调（可为 None）。
     """
     scheduler = Scheduler(cfg)
+    
+    # 定期清理超过 30 天的 token 分片（每天凌晨 1 点 UTC）
+    import asyncio
+    from datetime import datetime, timezone, timedelta
+    async def cleanup_task():
+        while True:
+            now = datetime.now(timezone.utc)
+            next_run = now.replace(hour=1, minute=0, second=0, microsecond=0)
+            if next_run <= now:
+                next_run += timedelta(days=1)
+            await asyncio.sleep((next_run - now).total_seconds())
+            scheduler.cleanup_old_tokens(30)
+    asyncio.create_task(cleanup_task())
+    
     logger = CallLogger(cfg.log.dir, cfg.log.enabled, cfg.log.redact_keys,
                         cfg.log.log_upstream, cfg.log.body_limit,
                         log_resp_body=cfg.log.log_resp_body,

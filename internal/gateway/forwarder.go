@@ -125,13 +125,13 @@ func (f *Forwarder) Forward(ctx context.Context, c *gin.Context, body []byte, m 
 	format := c.GetString("outbound_format")
 	switch {
 	case streamRequested && format == "claude":
-		res.FirstTokenMs, err = pipeSSEClaude(ctx, c, resp, m, begin)
+		err = pipeSSEClaude(ctx, c, resp, m, begin, res)
 	case streamRequested:
-		res.FirstTokenMs, err = f.pipeSSE(ctx, c, resp, m, begin)
+		err = f.pipeSSE(ctx, c, resp, m, begin, res)
 	case format == "claude":
-		err = f.pipeNonStreamClaude(c, resp, m)
+		err = f.pipeNonStreamClaude(c, resp, m, res)
 	default:
-		err = f.pipeNonStream(c, resp)
+		err = f.pipeNonStream(c, resp, res)
 	}
 	res.BodyCommitted = true
 	res.DurationMs = ms(time.Since(start))
@@ -185,7 +185,8 @@ func rewriteModel(body []byte, newModel string) ([]byte, error) {
 }
 
 // pipeSSE 做 SSE 管道式透传：逐行读上游、立即 Flush、空闲超时、keepalive ping。
-func (f *Forwarder) pipeSSE(ctx context.Context, c *gin.Context, resp *http.Response, m *Model, begin time.Time) (int64, error) {
+// 透传的同时嗅探每个 data 块中的 usage 字段，累计 token 用量写入 res。
+func (f *Forwarder) pipeSSE(ctx context.Context, c *gin.Context, resp *http.Response, m *Model, begin time.Time, res *ForwardResult) error {
 	defer resp.Body.Close()
 	w := c.Writer
 	w.Header().Set("Content-Type", "text/event-stream")
@@ -215,7 +216,6 @@ func (f *Forwarder) pipeSSE(ctx context.Context, c *gin.Context, resp *http.Resp
 		close(lines)
 	}()
 
-	var firstTokenMs int64
 	started := false
 	idle := time.NewTimer(m.IdleTimeout)
 	defer idle.Stop()
@@ -226,49 +226,86 @@ func (f *Forwarder) pipeSSE(ctx context.Context, c *gin.Context, resp *http.Resp
 		select {
 		case line, ok := <-lines:
 			if !ok {
-				return firstTokenMs, <-errCh
+				return <-errCh
 			}
 			if !started {
-				firstTokenMs = ms(time.Since(begin))
+				res.FirstTokenMs = ms(time.Since(begin))
 				started = true
 			}
+			sniffSSEUsage(line, res)
 			if _, err := fmt.Fprintln(w, line); err != nil {
-				return firstTokenMs, nil // 客户端已断开
+				return nil // 客户端已断开
 			}
 			flusher.Flush()
 			idle.Reset(m.IdleTimeout)
 		case <-keepalive.C:
 			if _, err := fmt.Fprint(w, ": keepalive\n\n"); err != nil {
-				return firstTokenMs, nil
+				return nil
 			}
 			flusher.Flush()
 		case <-idle.C:
-			return firstTokenMs, fmt.Errorf("stream idle timeout after %s", m.IdleTimeout)
+			return fmt.Errorf("stream idle timeout after %s", m.IdleTimeout)
 		case <-ctx.Done():
-			return firstTokenMs, ctx.Err()
+			return ctx.Err()
 		case <-c.Request.Context().Done():
-			return firstTokenMs, nil // 客户端断开
+			return nil // 客户端断开
 		}
 	}
 }
 
-// pipeNonStream 透传非流式响应（2xx），尽量保留上游状态码与关键响应头。
-func (f *Forwarder) pipeNonStream(c *gin.Context, resp *http.Response) error {
-	defer resp.Body.Close()
-	w := c.Writer
-	copyResponseHeaders(w.Header(), resp.Header)
-	w.WriteHeader(resp.StatusCode)
-	_, err := io.Copy(w, resp.Body)
-	return err
+// sniffSSEUsage 从一行 OpenAI SSE（data: {...}）中解析 usage.prompt_tokens /
+// completion_tokens，若存在则写入 res（最后出现的值覆盖，符合 OpenAI 末块携带完整 usage 的约定）。
+func sniffSSEUsage(line string, res *ForwardResult) {
+	line = strings.TrimSpace(line)
+	if !strings.HasPrefix(line, "data:") {
+		return
+	}
+	payload := strings.TrimSpace(strings.TrimPrefix(line, "data:"))
+	if payload == "" || payload == "[DONE]" || payload[0] != '{' {
+		return
+	}
+	var chunk struct {
+		Usage *struct {
+			PromptTokens     int `json:"prompt_tokens"`
+			CompletionTokens int `json:"completion_tokens"`
+		} `json:"usage"`
+	}
+	if json.Unmarshal([]byte(payload), &chunk) != nil || chunk.Usage == nil {
+		return
+	}
+	if chunk.Usage.PromptTokens > 0 {
+		res.PromptTokens = chunk.Usage.PromptTokens
+	}
+	if chunk.Usage.CompletionTokens > 0 {
+		res.CompletionTokens = chunk.Usage.CompletionTokens
+	}
 }
 
-// pipeNonStreamClaude 读上游 OpenAI 非流式响应，转成 Claude message JSON 后写回客户端。
-func (f *Forwarder) pipeNonStreamClaude(c *gin.Context, resp *http.Response, m *Model) error {
+// pipeNonStream 透传非流式响应（2xx），尽量保留上游状态码与关键响应头。
+// 从响应 JSON 中提取 usage 字段并写入 res。
+func (f *Forwarder) pipeNonStream(c *gin.Context, resp *http.Response, res *ForwardResult) error {
 	defer resp.Body.Close()
 	body, err := io.ReadAll(io.LimitReader(resp.Body, 32*1024*1024))
 	if err != nil {
 		return err
 	}
+	extractOpenAIUsageFromBody(body, res)
+	w := c.Writer
+	copyResponseHeaders(w.Header(), resp.Header)
+	w.WriteHeader(resp.StatusCode)
+	_, err = w.Write(body)
+	return err
+}
+
+// pipeNonStreamClaude 读上游 OpenAI 非流式响应，转成 Claude message JSON 后写回客户端。
+// 从上游响应提取 usage 并写入 res。
+func (f *Forwarder) pipeNonStreamClaude(c *gin.Context, resp *http.Response, m *Model, res *ForwardResult) error {
+	defer resp.Body.Close()
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 32*1024*1024))
+	if err != nil {
+		return err
+	}
+	extractOpenAIUsageFromBody(body, res)
 	out, err := openaiResponseToClaude(body, m.Cfg.Upstream.Model)
 	if err != nil {
 		// 转换失败：原样回退，避免完全无响应
@@ -296,3 +333,22 @@ func copyResponseHeaders(dst, src http.Header) {
 }
 
 func ms(d time.Duration) int64 { return d.Milliseconds() }
+
+// extractOpenAIUsageFromBody 从 OpenAI chat completion JSON 提取 usage 字段并写入 res。
+func extractOpenAIUsageFromBody(body []byte, res *ForwardResult) {
+	var resp struct {
+		Usage *struct {
+			PromptTokens     int `json:"prompt_tokens"`
+			CompletionTokens int `json:"completion_tokens"`
+		} `json:"usage"`
+	}
+	if json.Unmarshal(body, &resp) != nil || resp.Usage == nil {
+		return
+	}
+	if resp.Usage.PromptTokens > 0 {
+		res.PromptTokens = resp.Usage.PromptTokens
+	}
+	if resp.Usage.CompletionTokens > 0 {
+		res.CompletionTokens = resp.Usage.CompletionTokens
+	}
+}

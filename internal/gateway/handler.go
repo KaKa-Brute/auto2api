@@ -279,23 +279,29 @@ func (h *Handler) tryModel(c *gin.Context, body []byte, m *Model, streamRequeste
 		res, ferr := h.forwarder.Forward(c.Request.Context(), c, body, m, streamRequested)
 		if ferr == nil {
 			h.scheduler.RecordResult(m, msToDur(res.DurationMs), true)
+			h.scheduler.RecordTokens(m, res.PromptTokens, res.CompletionTokens)
 			h.logger.AddAttempt(entry, AttemptLog{
 				Model: m.Cfg.Name, Priority: m.Cfg.Priority, Upstream: res.UpstreamModel,
 				Status: res.Status, Outcome: "success", Attempt: attempt,
 				DurationMs: res.DurationMs, FirstTokenMs: res.FirstTokenMs,
+				PromptTokens: res.PromptTokens, CompletionTokens: res.CompletionTokens,
 			})
+			h.logger.SetUsage(entry, res.PromptTokens, res.CompletionTokens)
 			return outcomeSuccess, nil
 		}
 		// 响应体已提交（流式中途失败）——无法 fallback，结束本次请求
 		if res != nil && res.BodyCommitted {
 			// 已成功写入部分响应，不计熔断失败
 			h.scheduler.RecordResult(m, msToDur(res.DurationMs), true)
+			h.scheduler.RecordTokens(m, res.PromptTokens, res.CompletionTokens)
 			h.logger.AddAttempt(entry, AttemptLog{
 				Model: m.Cfg.Name, Priority: m.Cfg.Priority, Upstream: res.UpstreamModel,
 				Status: res.Status, Outcome: "success", Attempt: attempt,
 				DurationMs: res.DurationMs, FirstTokenMs: res.FirstTokenMs,
+				PromptTokens: res.PromptTokens, CompletionTokens: res.CompletionTokens,
 				Error: "body committed, abort fallback",
 			})
+			h.logger.SetUsage(entry, res.PromptTokens, res.CompletionTokens)
 			return outcomeSuccess, nil
 		}
 		ue, _ = ferr.(*UpstreamError)
@@ -397,7 +403,7 @@ func (h *Handler) Models(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"object": "list", "data": data})
 }
 
-// Health 返回每条链各模型的实时健康（优先级、上游模型、冷却/熔断状态、延迟、成功率、探活状态）。
+// Health 返回每条链各模型的实时健康（优先级、上游模型、冷却/熔断状态、延迟、成功率、探活状态、今日 token 用量）。
 func (h *Handler) Health(c *gin.Context) {
 	names := h.scheduler.ListChains()
 	out := gin.H{}
@@ -406,6 +412,7 @@ func (h *Handler) Health(c *gin.Context) {
 		models := make([]gin.H, 0, len(ch.Models))
 		for _, m := range ch.Models {
 			latency, success, total, fail := h.scheduler.Stats(m)
+			promptTok, completTok, totalTok := h.scheduler.TokenStats(m)
 			models = append(models, gin.H{
 				"name":              m.Cfg.Name,
 				"priority":          m.Cfg.Priority,
@@ -418,7 +425,10 @@ func (h *Handler) Health(c *gin.Context) {
 				"latency_ema_ms":    latency,
 				"success_rate":      success,
 				"total_requests":    total,
-				"total_failures":   fail,
+				"total_failures":    fail,
+				"prompt_tokens":     promptTok,
+				"completion_tokens": completTok,
+				"total_tokens":      totalTok,
 			})
 		}
 		out[name] = models

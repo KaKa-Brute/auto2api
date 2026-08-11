@@ -13,6 +13,7 @@
   - 层 1：同模型退避重试（`retryable_status`，指数退避封顶 3s）
   - 层 2：跨优先级模型故障转移（`trigger_status`，耗尽重试后切下一优先级）
 - **动态路由**：在可用模型集合内按 优先级 > 健康 > 成功率 > 延迟(EMA) 综合排序选最优
+- **Token 统计（按日期分片）**：自动提取上游 `usage` 字段，按 UTC 日期分片存储每个模型的输入/输出 token 累计；`/v1/health` 显示今日用量，调用日志记录每次请求的 token 数；历史数据保留 30 天，每天凌晨 1 点自动清理过期分片
 - **熔断器（可选）**：连续失败达阈值 → OPEN 长期摘除；冷却到期转 HALF_OPEN 半开探测；探测成功 → CLOSED 恢复
 - **主动健康检查（可选）**：后台周期性对每个上游发轻量探测请求，探测成功复位熔断器
 - **内存冷却**：失败模型按 `cooldown` 时长置入冷却，选择时自动跳过
@@ -21,7 +22,7 @@
 - **鉴权注入**：支持 `Authorization`(默认) / `x-api-key` / `x-goog-api-key` / 自定义头
 - **服务级 API Key**：可配置多个 key，客户端调用须携带其中之一；未配置则不鉴权
 - **头部白名单**：刻意剥离 `authorization` / `cookie` 等，避免泄露客户端凭据
-- **调用日志**：记录完整调用过程与输入输出（请求/上游请求/响应/每次尝试），按日期落盘 `logs/calls-YYYY-MM-DD.log`
+- **调用日志**：记录完整调用过程与输入输出（请求/上游请求/响应/每次尝试/token 用量），按日期落盘 `logs/calls-YYYY-MM-DD.log`
 - **环境变量展开**：`api_key: "${DEEPSEEK_KEY}"` 自动替换
 - **服务保护（可选）**：面向进程稳定性的防崩溃三板斧 + 优雅关闭（Go / Python 均实现）
   - **并发限流**：超过 `max_concurrent` 的请求进等待队列，队列满或等待超时立即返回 `503 + Retry-After`，防止上游超时导致连接无限堆积
@@ -73,7 +74,7 @@ Uvicorn running on http://0.0.0.0:8686
 | POST | `/v1/messages` | **Claude（Anthropic Messages API）兼容**，`model` 字段填链名 |
 | POST | `/messages` | 无 `/v1` 前缀的 Claude 兼容路径 |
 | GET  | `/v1/models` | 列出所有链名（OpenAI /v1/models 格式） |
-| GET  | `/v1/health` | 每条链各模型的实时健康：优先级、上游模型、是否冷却中、熔断状态、连续失败数、探活健康、延迟 EMA、成功率、总请求/失败数；含 `_protection`（并发数、拒绝/超时数、内存用量、降级状态、异常计数）（无需鉴权） |
+| GET  | `/v1/health` | 每条链各模型的实时健康：优先级、上游模型、是否冷却中、熔断状态、连续失败数、探活健康、延迟 EMA、成功率、总请求/失败数、**今日 token 用量**（prompt_tokens / completion_tokens / total_tokens）；含 `_protection`（并发数、拒绝/超时数、内存用量、降级状态、异常计数）（无需鉴权） |
 
 ### 调用示例
 
@@ -123,10 +124,42 @@ curl http://localhost:8080/v1/health
 - 请求 ID、时间戳、方法、路径、客户端 IP、已脱敏头部
 - 原始请求体（Claude/OpenAI 原样）+ 转发上游的请求体（已做模型改写）
 - 链名、是否流式、出站格式（openai/claude）
-- 每次模型尝试：模型名、优先级、上游模型、状态码、结局（success/retry/failover/client_error/error）、耗时、首 token 耗时、错误
-- 最终响应状态码、响应体（截断至 `body_limit`）、流式 SSE 数据块数、总耗时
+- 每次模型尝试：模型名、优先级、上游模型、状态码、结局（success/retry/failover/client_error/error）、耗时、首 token 耗时、**输入/输出 token 数**、错误
+- 最终响应状态码、响应体（截断至 `body_limit`）、流式 SSE 数据块数、总耗时、**本次请求总 token 数**
 
 日志字段已脱敏 `Authorization`/`x-api-key`，避免凭据落盘。
+
+**日志示例**：
+
+```json
+{
+  "id": "req_a1b2c3d4e5f6g7h8",
+  "timestamp": "2026-08-11T12:34:56.789Z",
+  "method": "POST",
+  "path": "/v1/chat/completions",
+  "client_ip": "127.0.0.1",
+  "chain": "auto-deepseek-v4-flash",
+  "format": "openai",
+  "stream": false,
+  "attempts": [
+    {
+      "model": "coding-plan",
+      "priority": 1,
+      "upstream_model": "deepseek-v4-flash",
+      "status": 200,
+      "outcome": "success",
+      "duration_ms": 234,
+      "first_token_ms": 89,
+      "prompt_tokens": 123,
+      "completion_tokens": 456
+    }
+  ],
+  "resp_status": 200,
+  "duration_ms": 240,
+  "prompt_tokens": 123,
+  "completion_tokens": 456
+}
+```
 
 ## 配置文件
 
@@ -277,33 +310,33 @@ auto2api/
 │   └── gateway/
 │       ├── handler.go             # 路由 + fallback 编排 + 调用日志集成
 │       ├── scheduler.go           # 链管理、冷却表、优先级选择、动态路由
-│       ├── forwarder.go           # 上游转发、模型改写、SSE 管道
-│       ├── claude.go              # Claude API 请求/响应/流式格式转换
+│       ├── forwarder.go           # 上游转发、模型改写、SSE 管道、token 提取
+│       ├── claude.go              # Claude API 请求/响应/流式格式转换、token 提取
 │       ├── breaker.go             # 熔断器三态机
-│       ├── metrics.go             # EMA 延迟/成功率指标
+│       ├── metrics.go             # EMA 延迟/成功率指标、按日期分片 token 统计
 │       ├── healthcheck.go         # 后台主动探活
 │       ├── limiter.go             # 并发限流器（令牌桶 + 等待队列）
 │       ├── memguard.go            # 内存守护（周期检测 + 自动降级 + GC）
 │       ├── recovery.go            # panic recovery 中间件
-│       └── call_logger.go         # 按日期轮转调用日志 + 响应录制
+│       └── call_logger.go         # 按日期轮转调用日志 + 响应录制 + token 字段
 │
 └── python/                        # —— Python 实现（与 Go 功能对齐，完全独立）——
     ├── main.py                    # Python 入口：uvicorn + Starlette
     ├── requirements.txt           # starlette / uvicorn / httpx / PyYAML / psutil
     └── auto2api/
         ├── config.py              # YAML 解析、默认值、${ENV} 展开、时长解析
-        ├── handler.py             # 路由 + 两级 fallback 编排 + 调用日志
+        ├── handler.py             # 路由 + 两级 fallback 编排 + 调用日志 + token 记录
         ├── scheduler.py           # 链管理、冷却表、优先级选择、动态路由
         ├── forwarder.py           # 上游转发（httpx）、模型改写、SSE 管道
         ├── claude.py              # Claude API 请求/响应/流式格式转换
         ├── breaker.py             # 熔断器三态机
-        ├── metrics.py             # EMA 延迟/成功率指标
+        ├── metrics.py             # EMA 延迟/成功率指标、按日期分片 token 统计
         ├── healthcheck.py         # 后台主动探活（asyncio）
         ├── limiter.py             # 并发限流器（asyncio 信号量 + 等待队列）
         ├── memguard.py            # 内存守护（asyncio 后台任务 + 降级 + GC）
         ├── recovery.py            # 异常恢复中间件（Starlette）
-        ├── call_logger.py         # 按日期轮转调用日志 + 响应录制
-        └── server.py              # Starlette 应用装配、路由注册、生命周期
+        ├── call_logger.py         # 按日期轮转调用日志 + 响应录制 + token 字段
+        └── server.py              # Starlette 应用装配、路由注册、生命周期、token 清理
 ```
 
 > Go 版与 Python 版实现相同的端点与行为，可按服务器已安装的运行时任选其一启动，无需同时安装 Go 和 Python。
@@ -316,6 +349,11 @@ auto2api/
 - **冷却键 `chain::name`**：按链隔离，避免跨链同名模型互相污染
 - **出站格式标记**：`/v1/messages` 置 `outbound_format=claude`，forwarder 据此分流 Claude 转换管线
 - **响应录制器**：透写给客户端的同时缓存，请求结束时把最终输出（含格式转换后）记入日志
+- **Token 统计按日期分片**：
+  - `Metrics` 内存中维护 `map[date]*tokenShard`（Go）/ `dict[date, TokenShard]`（Python），按 UTC 日期自动分片
+  - 从上游响应 JSON（非流式）或 SSE 数据块（流式）提取 `usage.prompt_tokens` / `completion_tokens`
+  - `Tokens()` 返回今日累计，`TokensForDate(date)` 查询历史，`CleanupOldTokens(keepDays)` 清理过期分片
+  - 每天凌晨 1 点 UTC 后台任务自动清理 30 天前数据，减少内存占用
 
 **Go 版**
 
@@ -323,6 +361,7 @@ auto2api/
 - `http.Client.Timeout=0`：流式安全，由请求级 `context.WithTimeout` 控制截止
 - `BodyCommitted` 标记：流式中途失败时响应体已写，不可再 fallback，直接结束
 - 单行 64MB 缓冲：`bufio.Scanner` 容纳上游长行 SSE
+- **Token 提取**：OpenAI 流式用 `sniffSSEUsage` 逐行解析 SSE 末块 usage；非流式读完 body 后 `extractOpenAIUsageFromBody`；Claude 流式在 `claudeStreamState` 维护 `inputTokens`/`outputTokens`
 - **并发限流**用带缓冲 channel 作信号量（令牌桶），`Acquire/Release` 无轮询、无 goroutine 泄漏；等待队列超限或超时快速失败
 - **内存守护**后台 goroutine 读 `runtime.MemStats.Alloc`，用原子标志无锁判断降级状态，降级中 `AllowRequest` 直接拒绝
 - **panic recovery** 自定义中间件替代 `gin.Recovery()`，记录 `debug.Stack()` 全量堆栈并累加计数
@@ -335,6 +374,7 @@ auto2api/
 - 转发用 `httpx.stream(...)` 先拿状态码：非 2xx 仍可 fallback，2xx 才提交响应体（等价于 Go 的 `BodyCommitted` 语义）
 - 共享 `httpx.AsyncClient`，并在事件循环变化时惰性重建连接池；连接池上限 `max_connections=100`、`max_keepalive_connections=50`、`keepalive_expiry=90s`
 - 健康检查为 asyncio 后台任务，随应用 `on_startup/on_shutdown` 生命周期启停
+- **Token 清理**：`server.py` 中 `asyncio.create_task(cleanup_task())` 启动后台任务，每天凌晨 1 点 UTC 调用 `scheduler.cleanup_old_tokens(30)`
 - **并发限流**用 `asyncio.Semaphore` 作令牌桶 + `waiting` 计数控制队列上限，`asyncio.wait_for` 实现等待超时；流式请求的槽位释放挂在响应 `BackgroundTask`，确保推流完毕后才释放
 - **内存守护**后台 asyncio 任务读进程 RSS（优先 `psutil`，未安装则自动禁用），超阈值 `gc.collect()` + 降级标志拒新请求
 - **异常恢复**用 Starlette `BaseHTTPMiddleware` 捕获未处理异常，记录 `traceback` 全量堆栈并累加计数

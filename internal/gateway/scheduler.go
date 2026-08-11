@@ -52,6 +52,8 @@ type ForwardResult struct {
 	UpstreamModel string
 	FirstTokenMs  int64
 	DurationMs    int64
+	PromptTokens  int // 本次调用上游返回的输入 token 数（无则 0）
+	CompletionTokens int // 本次调用上游返回的输出 token 数（无则 0）
 }
 
 // Scheduler 管理所有链与内存冷却表、熔断器、运行时指标。
@@ -287,6 +289,40 @@ func (s *Scheduler) Stats(m *Model) (float64, float64, int64, int64) {
 	}
 	total, fail := mt.Total()
 	return mt.LatencyEMA(), mt.SuccessRate(), total, fail
+}
+
+// RecordTokens 累加某模型一次调用的 token 用量到指标器。
+func (s *Scheduler) RecordTokens(m *Model, prompt, completion int) {
+	if mt := s.metricsOf(m); mt != nil {
+		mt.RecordTokens(prompt, completion)
+	}
+}
+
+// TokenStats 返回某模型今日的 (累计输入 token, 累计输出 token, 累计总 token)，供 /v1/health 展示。
+func (s *Scheduler) TokenStats(m *Model) (int64, int64, int64) {
+	mt := s.metricsOf(m)
+	if mt == nil {
+		return 0, 0, 0
+	}
+	return mt.Tokens()
+}
+
+// TokenStatsForDate 返回某模型指定日期的 token 统计（日期格式 "YYYY-MM-DD"）。
+func (s *Scheduler) TokenStatsForDate(m *Model, date string) (int64, int64, int64) {
+	mt := s.metricsOf(m)
+	if mt == nil {
+		return 0, 0, 0
+	}
+	return mt.TokensForDate(date)
+}
+
+// CleanupOldTokens 清理所有模型中超过指定天数的 token 分片。
+func (s *Scheduler) CleanupOldTokens(keepDays int) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	for _, mt := range s.metrics {
+		mt.CleanupOldTokens(keepDays)
+	}
 }
 
 // BreakerStateName 返回熔断器状态名（closed/open/half_open），供 /v1/health 展示。

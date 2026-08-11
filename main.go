@@ -38,6 +38,15 @@ func main() {
 	if err != nil {
 		log.Fatalf("init scheduler: %v", err)
 	}
+	// 定期清理超过 30 天的 token 分片（每天凌晨 1 点 UTC）
+	go func() {
+		for {
+			now := time.Now().UTC()
+			next := time.Date(now.Year(), now.Month(), now.Day()+1, 1, 0, 0, 0, time.UTC)
+			time.Sleep(time.Until(next))
+			sched.CleanupOldTokens(30)
+		}
+	}()
 	// 后台主动健康检查（可选）
 	var hc *gateway.HealthChecker
 	if cfg.HealthCheck.Enabled {
