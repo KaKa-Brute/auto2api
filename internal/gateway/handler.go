@@ -51,6 +51,11 @@ func (h *Handler) Register(r *gin.Engine) {
 	// OpenAI 兼容端点（受保护）
 	r.POST("/v1/chat/completions", protect, auth, h.ChatCompletions)
 	r.POST("/chat/completions", protect, auth, h.ChatCompletions) // 无 /v1 前缀的客户端兼容
+	// OpenAI Responses API 兼容端点（受保护，上游打 /v1/responses）
+	r.POST("/v1/responses", protect, func(c *gin.Context) {
+		c.Set("endpoint", "responses")
+		c.Next()
+	}, auth, h.ChatCompletions)
 	// Claude（Anthropic Messages API）兼容端点（受保护）
 	r.POST("/v1/messages", protect, auth, h.Messages)
 	r.POST("/messages", protect, auth, h.Messages) // 无 /v1 前缀兼容

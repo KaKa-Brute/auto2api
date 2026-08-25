@@ -90,6 +90,7 @@ def build_app(cfg: cfgmod.Config, config_path: str = "config.yaml", restart=None
     routes = [
         Route("/v1/chat/completions", handler.chat_completions, methods=["POST"]),
         Route("/chat/completions", handler.chat_completions, methods=["POST"]),
+        Route("/v1/responses", handler.responses, methods=["POST"]),
         Route("/v1/messages", handler.messages, methods=["POST"]),
         Route("/messages", handler.messages, methods=["POST"]),
         Route("/v1/models", handler.models, methods=["GET"]),

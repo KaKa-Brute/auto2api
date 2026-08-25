@@ -90,7 +90,7 @@ func (f *Forwarder) Forward(ctx context.Context, c *gin.Context, body []byte, m 
 			}
 		}
 	}
-	url := buildURL(m.Cfg.Upstream.BaseURL)
+	url := buildURL(m.Cfg.Upstream.BaseURL, c.GetString("endpoint"))
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(upBody))
 	if err != nil {
 		return &ForwardResult{}, err
@@ -138,13 +138,26 @@ func (f *Forwarder) Forward(ctx context.Context, c *gin.Context, body []byte, m 
 	return res, err
 }
 
-// buildURL 规整 base_url：已含 /chat/completions 则原样，否则追加 /chat/completions（如已有 /v1 则只追加 /chat/completions）。
-func buildURL(baseURL string) string {
+// buildURL 规整 base_url 并按 endpoint 追加路径。
+// endpoint 为 "responses" 时追加 /v1/responses（Responses API），
+// 默认（空或 "chat"）追加 /v1/chat/completions。
+// 若 base_url 已以 /chat/completions 或 /responses 结尾则原样返回。
+func buildURL(baseURL, endpoint string) string {
 	b := strings.TrimRight(baseURL, "/")
+	ep := strings.ToLower(strings.TrimSpace(endpoint))
+	if ep == "responses" {
+		if strings.HasSuffix(b, "/responses") {
+			return b
+		}
+		if versionSuffixRe.MatchString(b) {
+			return b + "/responses"
+		}
+		return b + "/v1/responses"
+	}
+	// 默认 chat/completions
 	if strings.HasSuffix(b, "/chat/completions") {
 		return b
 	}
-	// 已以版本段结尾（如 /v1、/v3）时只追加 /chat/completions，避免重复 /v1。
 	if versionSuffixRe.MatchString(b) {
 		return b + "/chat/completions"
 	}

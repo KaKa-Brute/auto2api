@@ -49,13 +49,22 @@ ALLOWED_HEADERS = {
 _VERSION_SUFFIX_RE = re.compile(r"/v\d+$")
 
 
-def build_url(base_url: str) -> str:
-    """规整 base_url：补齐 /v1/chat/completions。对齐 Go buildURL。
+def build_url(base_url: str, endpoint: str = "") -> str:
+    """规整 base_url 并按 endpoint 追加路径。对齐 Go buildURL。
 
-    若 base_url 已以版本段结尾（如 /v1、/v3），只追加 /chat/completions，
-    避免出现重复的 /v1（如 .../api/coding/v3/v1/chat/completions）。
+    endpoint 为 "responses" 时追加 /v1/responses（Responses API），
+    默认（空或 "chat"）追加 /v1/chat/completions。
+    若 base_url 已以对应路径结尾则原样返回。
     """
     b = base_url.rstrip("/")
+    ep = (endpoint or "").strip().lower()
+    if ep == "responses":
+        if b.endswith("/responses"):
+            return b
+        if _VERSION_SUFFIX_RE.search(b):
+            return b + "/responses"
+        return b + "/v1/responses"
+    # 默认 chat/completions
     if b.endswith("/chat/completions"):
         return b
     if _VERSION_SUFFIX_RE.search(b):
@@ -139,7 +148,7 @@ class Forwarder:
         return headers
 
     async def forward(self, req_headers, body: bytes, m, stream_requested: bool,
-                      outbound_format: str, entry=None) -> ForwardOutcome:
+                      outbound_format: str, entry=None, endpoint: str = "") -> ForwardOutcome:
         """把请求体转发到指定上游模型。
 
         返回 ForwardOutcome：
@@ -159,7 +168,7 @@ class Forwarder:
         if self._logger is not None and entry is not None:
             self._logger.set_upstream_request(entry, up_body)
 
-        url = build_url(m.cfg.upstream.base_url)
+        url = build_url(m.cfg.upstream.base_url, endpoint)
         headers = self._upstream_headers(req_headers, m)
         timeout = httpx.Timeout(m.timeout, connect=m.timeout, read=None, write=m.timeout)
         start = time.monotonic()

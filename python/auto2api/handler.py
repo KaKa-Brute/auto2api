@@ -207,6 +207,39 @@ class Handler:
             # 释放限流槽位：挂到响应 background，确保流式发送完毕后才释放
             self._attach_release(resp, acquired is True)
 
+    async def responses(self, request: Request) -> Response:
+        """POST /v1/responses（OpenAI Responses API 兼容）。
+
+        复用 OpenAI 出站格式与 fallback 编排，上游打 /v1/responses。
+        """
+        outbound = ""
+        err = self._check_auth(request, outbound)
+        if err is not None:
+            return err
+        err = self._check_protection(outbound)
+        if err is not None:
+            return err
+        acquired = await self._acquire_limit(outbound)
+        if isinstance(acquired, Response):
+            return acquired
+        entry = self._begin(request, "openai")
+        final_status = 200
+        final_err: Optional[Exception] = None
+        resp: Optional[Response] = None
+        try:
+            body = await request.body()
+            if not _valid_json(body):
+                final_status = 400
+                final_err = ValueError("request body is not valid JSON")
+                resp = json_error(400, "invalid_request_error", str(final_err), outbound)
+                return resp
+            resp, final_status, final_err = await self._run_completion(
+                request, body, entry, outbound, endpoint="responses")
+            return resp
+        finally:
+            self._logger.end(entry, final_status, final_err)
+            self._attach_release(resp, acquired is True)
+
     async def messages(self, request: Request) -> Response:
         """POST /v1/messages（Anthropic Claude Messages API 兼容）。"""
         outbound = "claude"
@@ -313,7 +346,8 @@ class Handler:
                                   client_ip, request.headers, fmt)
 
     async def _run_completion(self, request: Request, body: bytes, entry,
-                              outbound: str, req_recorded: bool = False):
+                              outbound: str, req_recorded: bool = False,
+                              endpoint: str = ""):
         """按 model 字段选链并执行两级 fallback 编排。返回 (Response, status, err)。"""
         chain_name = _extract_string(body, "model") or "auto"
         chain = self._scheduler.get_chain(chain_name)
@@ -342,7 +376,7 @@ class Handler:
                 continue
 
             outcome, err, resp = await self._try_model(
-                request, body, m, stream_requested, entry, outbound)
+                request, body, m, stream_requested, entry, outbound, endpoint)
             if err is not None:
                 last_err = err
             if outcome in (OUTCOME_SUCCESS, OUTCOME_CLIENT_ERROR):
@@ -360,14 +394,16 @@ class Handler:
                         502, last_err)
 
     async def _try_model(self, request: Request, body: bytes, m,
-                         stream_requested: bool, entry, outbound: str):
+                         stream_requested: bool, entry, outbound: str,
+                         endpoint: str = ""):
         """单模型层 1 退避重试。返回 (outcome, err, response)。"""
         ue: Optional[UpstreamError] = None
         req_headers = dict(request.headers)
         attempt = 0
         while attempt <= m.retry_count:
             out = await self._forwarder.forward(
-                req_headers, body, m, stream_requested, outbound, entry)
+                req_headers, body, m, stream_requested, outbound, entry,
+                endpoint=endpoint)
             res = out.result
             if out.error is None:
                 # 成功（响应已提交）
