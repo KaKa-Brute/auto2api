@@ -37,10 +37,13 @@ def build_app(cfg: cfgmod.Config, config_path: str = "config.yaml", restart=None
     config_path 用于管理台读写配置；restart 为触发服务重启的回调（可为 None）。
     """
     scheduler = Scheduler(cfg)
-    
-    # 定期清理超过 30 天的 token 分片（每天凌晨 1 点 UTC）
+
+    # 定期清理超过 30 天的 token 分片（每天凌晨 1 点 UTC）。
+    # 任务句柄存入 cleanup_handle，在 on_startup 中启动、on_shutdown 中取消。
     import asyncio
     from datetime import datetime, timezone, timedelta
+    cleanup_handle = None
+
     async def cleanup_task():
         while True:
             now = datetime.now(timezone.utc)
@@ -49,8 +52,8 @@ def build_app(cfg: cfgmod.Config, config_path: str = "config.yaml", restart=None
                 next_run += timedelta(days=1)
             await asyncio.sleep((next_run - now).total_seconds())
             scheduler.cleanup_old_tokens(30)
-    asyncio.create_task(cleanup_task())
-    
+
+
     logger = CallLogger(cfg.log.dir, cfg.log.enabled, cfg.log.redact_keys,
                         cfg.log.log_upstream, cfg.log.body_limit,
                         log_resp_body=cfg.log.log_resp_body,
@@ -102,6 +105,7 @@ def build_app(cfg: cfgmod.Config, config_path: str = "config.yaml", restart=None
     routes.extend(admin.routes())
 
     async def on_startup():
+        nonlocal cleanup_handle
         breaker_status = "enabled" if cfg.breaker.enabled else "disabled"
         _log.info("auto2api(python) listening, chains: %s, breaker: %s, call_log: %s, admin: /chat",
                   scheduler.list_chains(), breaker_status, logger.enabled())
@@ -112,9 +116,14 @@ def build_app(cfg: cfgmod.Config, config_path: str = "config.yaml", restart=None
         # 内存守护后台任务须在事件循环内启动
         if memguard is not None:
             memguard.start()
+        # token 分片清理后台任务须在事件循环内启动
+        cleanup_handle = asyncio.create_task(cleanup_task())
 
     async def on_shutdown():
+        nonlocal cleanup_handle
         # 优雅关闭：停止后台任务，关闭上游连接池
+        if cleanup_handle is not None:
+            cleanup_handle.cancel()
         if memguard is not None:
             await memguard.stop()
         if health_checker is not None:

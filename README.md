@@ -8,6 +8,7 @@
 
 - **Claude（Anthropic Messages API）兼容**：`POST /v1/messages` 入站，请求/响应与流式 SSE 自动做 Claude↔OpenAI 格式转换，Claude SDK 可直连
 - **OpenAI 兼容**：`POST /v1/chat/completions` 透传
+- **OpenAI Responses API 兼容**：`POST /v1/responses` 入站，上游打 `/v1/responses`，复用 fallback 编排与 SSE 透传
 - **命名链**：客户端在 `model` 字段填链名（如 `auto` / `cn` / `coding`），即可走对应链的优先级组
 - **两级 fallback**
   - 层 1：同模型退避重试（`retryable_status`，指数退避封顶 3s）
@@ -71,6 +72,7 @@ Uvicorn running on http://0.0.0.0:8686
 |------|------|------|
 | POST | `/v1/chat/completions` | OpenAI 兼容聊天接口，`model` 字段填链名 |
 | POST | `/chat/completions` | 无 `/v1` 前缀的兼容路径 |
+| POST | `/v1/responses` | **OpenAI Responses API 兼容**，上游打 `/v1/responses`，`model` 字段填链名 |
 | POST | `/v1/messages` | **Claude（Anthropic Messages API）兼容**，`model` 字段填链名 |
 | POST | `/messages` | 无 `/v1` 前缀的 Claude 兼容路径 |
 | GET  | `/v1/models` | 列出所有链名（OpenAI /v1/models 格式） |
