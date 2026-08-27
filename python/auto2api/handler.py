@@ -1,4 +1,4 @@
-"""HTTP 路由与两级 fallback 编排。对齐 Go 版 internal/gateway/handler.go。
+"""HTTP 路由与两级 fallback 编排。
 
 层 1：同模型退避重试（retryable_status）
 层 2：跨优先级模型故障转移（trigger_status）

@@ -2,7 +2,7 @@
 
 优先级自动切换的 OpenAI / Claude 兼容 API 网关。多套命名链、按优先级 fallback、同模型退避重试、跨模型故障转移、熔断器、主动健康检查、SSE 流式透传、调用日志按日期落盘、服务保护（并发限流 / 内存守护 / 异常恢复 / 优雅关闭）。
 
-> **双运行时**：提供 **Go** 和 **Python** 两套功能完全对齐、彼此独立的实现，共用同一份 `config.yaml`。服务器上装了哪个运行时就用哪个启动，无需同时安装 Go 和 Python。所有能力（fallback、熔断、健康检查、Claude/OpenAI 转换、调用日志、服务保护）两版一致。
+基于 **Python**（Starlette + uvicorn + httpx）实现，所有能力（fallback、熔断、健康检查、Claude/OpenAI 转换、调用日志、服务保护）开箱即用。
 
 ## 核心特性
 
@@ -25,18 +25,14 @@
 - **头部白名单**：刻意剥离 `authorization` / `cookie` 等，避免泄露客户端凭据
 - **调用日志**：记录完整调用过程与输入输出（请求/上游请求/响应/每次尝试/token 用量），按日期落盘 `logs/calls-YYYY-MM-DD.log`
 - **环境变量展开**：`api_key: "${DEEPSEEK_KEY}"` 自动替换
-- **服务保护（可选）**：面向进程稳定性的防崩溃三板斧 + 优雅关闭（Go / Python 均实现）
+- **服务保护（可选）**：面向进程稳定性的防崩溃三板斧 + 优雅关闭
   - **并发限流**：超过 `max_concurrent` 的请求进等待队列，队列满或等待超时立即返回 `503 + Retry-After`，防止上游超时导致连接无限堆积
   - **内存守护**：后台周期检测进程内存，超警告阈值主动 GC，超临界阈值进入降级模式（拒新请求 + 强制 GC），内存回落后自动恢复，防内存泄漏 / OOM
-  - **异常恢复**：捕获所有未处理异常（Go panic / Python exception），记录完整堆栈与计数并返回 500，进程不退出（自动启用，无需配置）
+  - **异常恢复**：捕获所有未处理异常，记录完整堆栈与计数并返回 500，进程不退出（自动启用，无需配置）
   - **优雅关闭**：收到 `SIGINT`/`SIGTERM` 停止接收新请求，等待在途请求完成后再退出，并停止后台任务
   - **连接池上限**：上游 HTTP 客户端限制每主机连接数与空闲连接回收，防连接/句柄泄漏
 
 ## 快速开始
-
-本项目提供 **Go** 和 **Python** 两套功能完全对齐、彼此独立的实现，共用同一份 `config.yaml`。服务器上装了哪个运行时就用哪个启动，二者互不依赖。
-
-### 方式一：Python 模式（默认，无需安装 Go）
 
 ```bash
 cd python
@@ -44,15 +40,7 @@ pip install -r requirements.txt          # 首次运行安装依赖：starlette 
 python main.py -config ../config.yaml     # -config 指向配置文件（可用相对/绝对路径）
 ```
 
-### 方式二：Go 模式（无需安装 Python）
-
-```bash
-go run . -config config.yaml
-# 或编译后运行
-go build -o auto2api . && ./auto2api -config config.yaml
-```
-
-两种方式默认都监听 `config.yaml` 里的 `server.addr`（缺省 `:8080`），启动日志会列出所有链名与开关状态，例如：
+默认监听 `config.yaml` 里的 `server.addr`（缺省 `:8080`），启动日志会列出所有链名与开关状态，例如：
 
 ```
 concurrency limiter enabled: max=200 queue=400 timeout=30s
@@ -64,7 +52,7 @@ Uvicorn running on http://0.0.0.0:8686
 
 > **提示**：`log.dir` 用相对路径时，日志目录相对于**启动时的工作目录**。例如从 `python/` 目录启动则日志落在 `python/logs/`，从仓库根启动则落在 `logs/`。
 
-所有端点、fallback 编排、Claude/OpenAI 转换、熔断、健康检查、调用日志行为在两种模式下完全一致。
+所有端点、fallback 编排、Claude/OpenAI 转换、熔断、健康检查、调用日志行为完全一致。
 
 ## API 端点
 
@@ -117,7 +105,7 @@ curl http://localhost:8080/v1/health
 
 > **Claude 兼容说明**：`/v1/messages` 入站为 Claude 格式，内部转成 OpenAI 格式走上游（上游须为 OpenAI 兼容端点），响应再转回 Claude 格式。支持 system 顶层、文本/图片内容块、工具调用（tool_use/tool_result）、stop_sequences 映射，流式 SSE 事件（message_start / content_block_delta / message_delta / message_stop）全套转换。
 
-> **两层鉴权**：客户端的 `Authorization`/`x-api-key` 用于**服务级鉴权**（须匹配 `server.api_keys`），通过后被剥离；转发上游时由 [setAuth](file:///d:\desktop\auto2api\internal\gateway\forwarder.go) 用每个模型配置的 `api_key` 重新注入。
+> **两层鉴权**：客户端的 `Authorization`/`x-api-key` 用于**服务级鉴权**（须匹配 `server.api_keys`），通过后被剥离；转发上游时由 [forwarder](file:///d:\desktop\ai_coding\auto2api\python\auto2api\forwarder.py) 用每个模型配置的 `api_key` 重新注入。
 
 ## 调用日志
 
@@ -197,9 +185,9 @@ health_check:
   interval: "60s"               # 探活周期
   timeout: "10s"                # 单次探活请求超时
 
-# 服务保护（可选，Go / Python 均支持，默认关闭）。总开关 enabled 关闭时下列功能均不启用。防崩溃三板斧：
+# 服务保护（可选，默认关闭）。总开关 enabled 关闭时下列功能均不启用。防崩溃三板斧：
 #   1. 并发限流：防上游超时导致连接无限堆积
-#   2. 内存守护：防内存泄漏/OOM，超阈值自动降级（Python 版需安装 psutil）
+#   2. 内存守护：防内存泄漏/OOM，超阈值自动降级（需安装 psutil）
 #   3. 异常恢复：自动启用，捕获未捕获异常防进程退出（无需配置）
 protection:
   enabled: false                # 总开关，默认关闭；置 true 才启用并发限流与内存守护
@@ -302,27 +290,10 @@ chains:
 
 ```
 auto2api/
-├── config.yaml                    # 多链 + 优先级 + 日志配置（Go / Python 共用）
+├── config.yaml                    # 多链 + 优先级 + 日志配置
 ├── config.example.yaml            # 配置模板
 │
-├── main.go                        # Go 入口：加载配置，启动 gin 服务
-├── go.mod
-├── internal/                      # —— Go 实现 ——
-│   ├── config/config.go           # YAML 解析、默认值、${ENV} 展开
-│   └── gateway/
-│       ├── handler.go             # 路由 + fallback 编排 + 调用日志集成
-│       ├── scheduler.go           # 链管理、冷却表、优先级选择、动态路由
-│       ├── forwarder.go           # 上游转发、模型改写、SSE 管道、token 提取
-│       ├── claude.go              # Claude API 请求/响应/流式格式转换、token 提取
-│       ├── breaker.go             # 熔断器三态机
-│       ├── metrics.go             # EMA 延迟/成功率指标、按日期分片 token 统计
-│       ├── healthcheck.go         # 后台主动探活
-│       ├── limiter.go             # 并发限流器（令牌桶 + 等待队列）
-│       ├── memguard.go            # 内存守护（周期检测 + 自动降级 + GC）
-│       ├── recovery.go            # panic recovery 中间件
-│       └── call_logger.go         # 按日期轮转调用日志 + 响应录制 + token 字段
-│
-└── python/                        # —— Python 实现（与 Go 功能对齐，完全独立）——
+└── python/                        # —— Python 实现 ——
     ├── main.py                    # Python 入口：uvicorn + Starlette
     ├── requirements.txt           # starlette / uvicorn / httpx / PyYAML / psutil
     └── auto2api/
@@ -341,8 +312,6 @@ auto2api/
         └── server.py              # Starlette 应用装配、路由注册、生命周期、token 清理
 ```
 
-> Go 版与 Python 版实现相同的端点与行为，可按服务器已安装的运行时任选其一启动，无需同时安装 Go 和 Python。
-
 ## 设计要点
 
 **通用**
@@ -352,28 +321,15 @@ auto2api/
 - **出站格式标记**：`/v1/messages` 置 `outbound_format=claude`，forwarder 据此分流 Claude 转换管线
 - **响应录制器**：透写给客户端的同时缓存，请求结束时把最终输出（含格式转换后）记入日志
 - **Token 统计按日期分片**：
-  - `Metrics` 内存中维护 `map[date]*tokenShard`（Go）/ `dict[date, TokenShard]`（Python），按 UTC 日期自动分片
+  - `Metrics` 内存中维护 `dict[date, TokenShard]`，按 UTC 日期自动分片
   - 从上游响应 JSON（非流式）或 SSE 数据块（流式）提取 `usage.prompt_tokens` / `completion_tokens`
   - `Tokens()` 返回今日累计，`TokensForDate(date)` 查询历史，`CleanupOldTokens(keepDays)` 清理过期分片
   - 每天凌晨 1 点 UTC 后台任务自动清理 30 天前数据，减少内存占用
 
-**Go 版**
-
-- 手动构造上游 `*http.Request`（非 `httputil.ReverseProxy`）
-- `http.Client.Timeout=0`：流式安全，由请求级 `context.WithTimeout` 控制截止
-- `BodyCommitted` 标记：流式中途失败时响应体已写，不可再 fallback，直接结束
-- 单行 64MB 缓冲：`bufio.Scanner` 容纳上游长行 SSE
-- **Token 提取**：OpenAI 流式用 `sniffSSEUsage` 逐行解析 SSE 末块 usage；非流式读完 body 后 `extractOpenAIUsageFromBody`；Claude 流式在 `claudeStreamState` 维护 `inputTokens`/`outputTokens`
-- **并发限流**用带缓冲 channel 作信号量（令牌桶），`Acquire/Release` 无轮询、无 goroutine 泄漏；等待队列超限或超时快速失败
-- **内存守护**后台 goroutine 读 `runtime.MemStats.Alloc`，用原子标志无锁判断降级状态，降级中 `AllowRequest` 直接拒绝
-- **panic recovery** 自定义中间件替代 `gin.Recovery()`，记录 `debug.Stack()` 全量堆栈并累加计数
-- **优雅关闭**用 `http.Server.Shutdown(ctx)` + 信号监听，关闭时同步停止内存守护与健康检查后台任务
-- **连接池**自定义 `http.Transport`：`MaxConnsPerHost=100`、`MaxIdleConnsPerHost=50`、`IdleConnTimeout=90s`
-
 **Python 版**
 
 - 基于 `Starlette + uvicorn + httpx`（asyncio）
-- 转发用 `httpx.stream(...)` 先拿状态码：非 2xx 仍可 fallback，2xx 才提交响应体（等价于 Go 的 `BodyCommitted` 语义）
+- 转发用 `httpx.stream(...)` 先拿状态码：非 2xx 仍可 fallback，2xx 才提交响应体
 - 共享 `httpx.AsyncClient`，并在事件循环变化时惰性重建连接池；连接池上限 `max_connections=100`、`max_keepalive_connections=50`、`keepalive_expiry=90s`
 - 健康检查为 asyncio 后台任务，随应用 `on_startup/on_shutdown` 生命周期启停
 - **Token 清理**：`server.py` 中 `asyncio.create_task(cleanup_task())` 启动后台任务，每天凌晨 1 点 UTC 调用 `scheduler.cleanup_old_tokens(30)`

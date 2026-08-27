@@ -1,5 +1,5 @@
 """调用日志：记录完整调用过程与输入输出，按日期 + 大小轮转落盘为 JSONL。
-对齐 Go 版 internal/gateway/call_logger.go。文件名形如 logs/calls-2026-07-20.log，
+文件名形如 logs/calls-2026-07-20.log，
 跨天或文件超限时轮转，旧文件可 gzip 压缩，超龄自动删除。
 """
 import gzip
@@ -159,7 +159,7 @@ def _is_rotated(name: str) -> bool:
 
 
 class CallLogger:
-    """按日期 + 大小轮转的调用日志记录器。对齐 Go CallLogger。"""
+    """按日期 + 大小轮转的调用日志记录器。"""
 
     def __init__(self, dir_: str, enabled: bool, redact: bool,
                  upstream: bool, body_limit: int, *,

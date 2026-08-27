@@ -1,4 +1,4 @@
-"""熔断器：CLOSED → OPEN → HALF_OPEN → CLOSED 三态机。对齐 Go 版 breaker.go。
+"""熔断器：CLOSED → OPEN → HALF_OPEN → CLOSED 三态机。
 
 与 failover.cooldown 的关系：cooldown 是单次失败后短期冷却；
 熔断器是连续失败累积后长期熔断 + 半开探测恢复，二者叠加。

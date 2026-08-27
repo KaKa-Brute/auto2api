@@ -1,29 +1,8 @@
 # 真实配置（含凭据，使用 config.example.yaml 作为模板）
 config.yaml
 
-# 编译产物
-*.exe
-*.exe~
-*.dll
-*.so
-*.dylib
-/auto2api
-/auto2api.exe
-
-# 测试产物
-*.test
-*.out
-
 # 调用日志（按日期落盘，含输入输出，勿入库）
 logs/
-
-# Go 工作区
-vendor/
-go.work
-go.work.sum
-
-# Go 构建缓存
-.gocache/
 
 # IDE / 编辑器
 .idea/

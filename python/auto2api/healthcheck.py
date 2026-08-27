@@ -1,4 +1,4 @@
-"""后台主动健康检查：周期性探活每个上游模型。对齐 Go 版 internal/gateway/healthcheck.go。
+"""后台主动健康检查：周期性探活每个上游模型。
 
 探活不经过 Forwarder（避免污染业务指标与调用日志），用独立 httpx.AsyncClient
 发一条最小 user 消息 + max_tokens=1 的请求，只看状态码判断端点是否可达。

@@ -1,4 +1,4 @@
-"""内存守护：监控进程内存并自动降级防止 OOM。对齐 Go 版 internal/gateway/memguard.py。
+"""内存守护：监控进程内存并自动降级防止 OOM。
 
 后台 asyncio 任务周期检测进程 RSS，超警告阈值主动 gc.collect()，
 超临界阈值进入降级模式（拒新请求 + 强制 GC），内存回落后自动恢复。

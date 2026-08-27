@@ -1,6 +1,5 @@
 """可视化管理台（/chat）：免鉴权的配置编辑、服务重启、日志查看。
 
-对齐 Go 版 internal/gateway/admin.go。
 安全提示：本页面不鉴权，会暴露配置（含上游 api_key）与重启能力，仅建议内网/本机使用。
 """
 import os
@@ -130,7 +129,7 @@ class AdminHandler:
         })
 
 
-# /chat 管理页的内联 HTML（无外部依赖，纯原生 JS）。与 Go 版 admin_page.go 保持一致。
+# /chat 管理页的内联 HTML（无外部依赖，纯原生 JS）。
 ADMIN_PAGE_HTML = r"""<!DOCTYPE html>
 <html lang="zh-CN">
 <head>

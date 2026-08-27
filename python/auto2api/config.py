@@ -1,4 +1,4 @@
-"""配置解析：多套命名链 + 每链多优先级模型。对齐 Go 版 internal/config/config.go。
+"""配置解析：多套命名链 + 每链多优先级模型。
 
 支持 ${ENV} 环境变量展开、默认值填充、按 priority 升序排序。
 """
@@ -18,7 +18,7 @@ _DUR_UNITS = {
 
 
 def expand_env(s: str) -> str:
-    """把 ${ENV} 替换成环境变量值（未设置则替换为空串），对齐 Go ExpandEnv。"""
+    """把 ${ENV} 替换成环境变量值（未设置则替换为空串）。"""
     return _ENV_RE.sub(lambda m: os.environ.get(m.group(1), ""), s)
 
 
@@ -129,7 +129,7 @@ class HealthCheckConfig:
 
 @dataclass
 class ProtectionConfig:
-    """服务保护配置（防崩溃三板斧）。对齐 Go 版 ProtectionConfig。"""
+    """服务保护配置（防崩溃三板斧）。"""
     enabled: bool = False          # 总开关，默认关闭；关闭时不启用并发限流与内存守护
     # 并发限流：防止上游 API 超时导致连接堆积
     max_concurrent: int = 0        # 最大并发请求数，0=不限制
@@ -185,7 +185,7 @@ def _model_from_dict(d: dict) -> ModelConfig:
 
 
 def load(path: str) -> Config:
-    """读取并校验配置，填充默认值，按 priority 升序排序每条链的模型。对齐 Go Load。"""
+    """读取并校验配置，填充默认值，按 priority 升序排序每条链的模型。"""
     with open(path, "r", encoding="utf-8") as fp:
         raw = yaml.safe_load(fp) or {}
 

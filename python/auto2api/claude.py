@@ -1,4 +1,4 @@
-"""Claude（Anthropic Messages API）兼容层。对齐 Go 版 internal/gateway/claude.go。
+"""Claude（Anthropic Messages API）兼容层。
 
 入站：客户端按 Claude 格式 POST /v1/messages，请求体转 OpenAI 格式后走上游。
 出站：上游 OpenAI 响应（非流式 JSON / 流式 SSE）转回 Claude 格式。
@@ -347,7 +347,7 @@ def _extract_openai_usage(u: Any) -> Tuple[int, int]:
 # ---- 响应转换：OpenAI → Claude（流式 SSE）----
 
 class ClaudeStreamState:
-    """维护 OpenAI→Claude 流式转换的跨事件状态。对齐 Go claudeStreamState。"""
+    """维护 OpenAI→Claude 流式转换的跨事件状态。"""
 
     def __init__(self, model: str) -> None:
         self.message_start_sent = False

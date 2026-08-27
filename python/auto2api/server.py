@@ -1,5 +1,4 @@
 """Starlette 应用装配：加载配置、构建调度器/转发器/日志/健康检查，注册路由。
-对齐 Go 版 main.go 的启动流程。
 """
 import logging
 

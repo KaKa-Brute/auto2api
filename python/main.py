@@ -2,7 +2,7 @@
 
 用法：
     python main.py -config config.yaml
-与 Go 版完全独立，功能对齐。默认监听 :8080。
+默认监听 :8080。
 内置可视化管理台（/chat，免鉴权）：编辑配置、重启服务、查看日志。
 """
 import argparse
@@ -22,7 +22,7 @@ _log = logging.getLogger("auto2api")
 
 
 def wait_for_port(host: str, port: int, timeout: float = 10.0) -> None:
-    """在绑定前等待端口释放（用于重启时新进程等待旧进程退出）。对齐 Go listenWithRetry。"""
+    """在绑定前等待端口释放（用于重启时新进程等待旧进程退出）。"""
     bind_host = "127.0.0.1" if host in ("0.0.0.0", "") else host
     deadline = time.time() + timeout
     while True:
@@ -41,7 +41,7 @@ def wait_for_port(host: str, port: int, timeout: float = 10.0) -> None:
 
 
 def spawn_self() -> None:
-    """以相同解释器与参数启动一个新进程（继承环境与工作目录）。对齐 Go spawnSelf。
+    """以相同解释器与参数启动一个新进程（继承环境与工作目录）。
 
     新进程通过 wait_for_port 等待本进程释放端口后接管服务。
     """

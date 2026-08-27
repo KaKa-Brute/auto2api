@@ -1,7 +1,6 @@
 """转发器：手动构造上游请求，头部白名单透传 + 鉴权注入 + body 模型改写 + SSE 管道。
-对齐 Go 版 internal/gateway/forwarder.go。
 
-与 Go 的差异：Python 异步流式在 handler 返回后才真正推流，因此用 httpx stream=True
+Python 异步流式在 handler 返回后才真正推流，因此用 httpx stream=True
 先拿到状态码（非 2xx 可 fallback），2xx 才提交响应体（提交后不可再 fallback）。
 """
 import asyncio
@@ -50,7 +49,7 @@ _VERSION_SUFFIX_RE = re.compile(r"/v\d+$")
 
 
 def build_url(base_url: str, endpoint: str = "") -> str:
-    """规整 base_url 并按 endpoint 追加路径。对齐 Go buildURL。
+    """规整 base_url 并按 endpoint 追加路径。
 
     endpoint 为 "responses" 时追加 /v1/responses（Responses API），
     默认（空或 "chat"）追加 /v1/chat/completions。
@@ -73,7 +72,7 @@ def build_url(base_url: str, endpoint: str = "") -> str:
 
 
 def set_auth_headers(headers: Dict[str, str], auth_header: str, api_key: str) -> None:
-    """按配置注入鉴权头。对齐 Go setAuth。"""
+    """按配置注入鉴权头。"""
     h = (auth_header or "").strip().lower()
     if h in ("", "authorization", "bearer"):
         headers["Authorization"] = "Bearer " + api_key
@@ -86,7 +85,7 @@ def set_auth_headers(headers: Dict[str, str], auth_header: str, api_key: str) ->
 
 
 def rewrite_model(body: bytes, new_model: str) -> bytes:
-    """用上游真实模型名改写 body 的 model 字段，保留其余字段。对齐 Go rewriteModel。"""
+    """用上游真实模型名改写 body 的 model 字段，保留其余字段。"""
     obj = json.loads(body)
     if not isinstance(obj, dict):
         obj = {}
@@ -119,7 +118,6 @@ class Forwarder:
         """惰性创建 httpx client，并在事件循环变化时重建（连接池绑定 loop）。
 
         限制连接池上限，防止上游超时导致连接无限堆积撑爆内存/句柄。
-        对齐 Go 版 forwarder 的 http.Transport 连接池配置。
         """
         loop = asyncio.get_event_loop()
         if self._client is None or self._client_loop is not loop:

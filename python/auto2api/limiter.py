@@ -1,4 +1,4 @@
-"""并发限流器：防止上游 API 超时导致连接堆积。对齐 Go 版 internal/gateway/limiter.py。
+"""并发限流器：防止上游 API 超时导致连接堆积。
 
 用 asyncio.Semaphore 作令牌桶，waiting 计数记录排队数，超过 max_queue_size
 直接拒绝，等待超时快速失败，避免请求无限堆积撑爆内存/句柄。
