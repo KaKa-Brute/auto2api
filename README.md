@@ -8,7 +8,7 @@
 
 - **Claude（Anthropic Messages API）兼容**：`POST /v1/messages` 入站，请求/响应与流式 SSE 自动做 Claude↔OpenAI 格式转换，Claude SDK 可直连
 - **OpenAI 兼容**：`POST /v1/chat/completions` 透传
-- **OpenAI Responses API 兼容**：`POST /v1/responses` 入站，上游打 `/v1/responses`，复用 fallback 编排与 SSE 透传
+- **OpenAI Responses API 兼容**：`POST /v1/responses` 入站，Codex CLI 可直连；上游原生支持时直通 `/v1/responses`，仅支持 Chat Completions 的上游（或 auto 探测失败）自动做 Responses↔Chat 转换，复用 fallback 编排与 SSE 透传
 - **命名链**：客户端在 `model` 字段填链名（如 `auto` / `cn` / `coding`），即可走对应链的优先级组
 - **两级 fallback**
   - 层 1：同模型退避重试（`retryable_status`，指数退避封顶 3s）
@@ -60,7 +60,7 @@ Uvicorn running on http://0.0.0.0:8686
 |------|------|------|
 | POST | `/v1/chat/completions` | OpenAI 兼容聊天接口，`model` 字段填链名 |
 | POST | `/chat/completions` | 无 `/v1` 前缀的兼容路径 |
-| POST | `/v1/responses` | **OpenAI Responses API 兼容**，上游打 `/v1/responses`，`model` 字段填链名 |
+| POST | `/v1/responses` | **OpenAI Responses API 兼容**，Codex CLI 可直连；上游不支持 Responses API 时自动转成 Chat Completions 调用（见下），`model` 字段填链名 |
 | POST | `/v1/messages` | **Claude（Anthropic Messages API）兼容**，`model` 字段填链名 |
 | POST | `/messages` | 无 `/v1` 前缀的 Claude 兼容路径 |
 | GET  | `/v1/models` | 列出所有链名（OpenAI /v1/models 格式） |
@@ -99,11 +99,23 @@ curl -N http://localhost:8080/v1/messages \
   -H "anthropic-version: 2023-06-01" \
   -d '{"model":"auto","max_tokens":1024,"messages":[{"role":"user","content":"hi"}],"stream":true}'
 
+# OpenAI Responses API 格式（Codex CLI 直连）
+curl http://localhost:8080/v1/responses \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer sk-auto2api-1127741X" \
+  -d '{
+    "model": "auto",
+    "input": "ping",
+    "max_output_tokens": 1024
+  }'
+
 # 查看健康状态（无需鉴权）
 curl http://localhost:8080/v1/health
 ```
 
 > **Claude 兼容说明**：`/v1/messages` 入站为 Claude 格式，内部转成 OpenAI 格式走上游（上游须为 OpenAI 兼容端点），响应再转回 Claude 格式。支持 system 顶层、文本/图片内容块、工具调用（tool_use/tool_result）、stop_sequences 映射，流式 SSE 事件（message_start / content_block_delta / message_delta / message_stop）全套转换。
+
+> **Responses 兼容说明**：`/v1/responses` 入站为 Responses API 格式，按上游 `endpoint` 配置分流（见上表）。上游原生支持时直通；仅支持 Chat Completions 的上游自动把请求转成 Chat 格式、响应（含流式 SSE：response.created / output_item.added / content_part.added / output_text.delta / output_item.done / response.completed）转回 Responses 格式。`auto` 模式先试直通，遇上游 404/400（端点不存在或伪实现）自动降级为 Chat 转换。支持 input 字符串/消息列表、instructions、工具调用（function_call / function_call_output）、流式与非流式。
 
 > **两层鉴权**：客户端的 `Authorization`/`x-api-key` 用于**服务级鉴权**（须匹配 `server.api_keys`），通过后被剥离；转发上游时由 [forwarder](file:///d:\desktop\ai_coding\auto2api\python\auto2api\forwarder.py) 用每个模型配置的 `api_key` 重新注入。
 
@@ -211,6 +223,7 @@ chains:
         api_key: "sk-xxx"             # 或 ${ENV}
         auth_header: "Authorization"  # 默认；或 x-api-key / x-goog-api-key
         timeout: "120s"
+        endpoint: "auto"              # 仅 /v1/responses 入站：auto(探测)/responses(直通)/chat(转换)
       retry:
         count: 2                       # 同模型内重试次数（不含首次）
         backoff: ["300ms","600ms","1.2s"]   # 指数退避，封顶 3s
@@ -253,6 +266,7 @@ chains:
 | `protection.memory_check_interval` | `10s` | 内存检查周期 |
 | `upstream.timeout` | `120s` | 上游请求超时 |
 | `upstream.auth_header` | `Authorization` | 鉴权头类型 |
+| `upstream.endpoint` | `auto` | 仅 `/v1/responses` 入站生效：`responses` 直通上游 `/v1/responses`；`chat` 转成 Chat Completions 调用并转换响应；`auto` 先直通，上游 404/400 时自动降级为 `chat` |
 | `failover.cooldown` | `60s` | 失败模型冷却时长 |
 | `stream.idle_timeout` | `30s` | SSE 空闲超时 |
 | `stream.keepalive` | `5s` | SSE keepalive 间隔 |
@@ -302,6 +316,7 @@ auto2api/
         ├── scheduler.py           # 链管理、冷却表、优先级选择、动态路由
         ├── forwarder.py           # 上游转发（httpx）、模型改写、SSE 管道
         ├── claude.py              # Claude API 请求/响应/流式格式转换
+        ├── responses.py           # Responses↔Chat 请求/响应/流式转换（auto 降级模式）
         ├── breaker.py             # 熔断器三态机
         ├── metrics.py             # EMA 延迟/成功率指标、按日期分片 token 统计
         ├── healthcheck.py         # 后台主动探活（asyncio）
@@ -319,6 +334,7 @@ auto2api/
 - **头部白名单 + 鉴权注入**：手动构造上游请求（非反向代理），精确控制透传头部与模型改写
 - **冷却键 `chain::name`**：按链隔离，避免跨链同名模型互相污染
 - **出站格式标记**：`/v1/messages` 置 `outbound_format=claude`，forwarder 据此分流 Claude 转换管线
+- **Responses 端点分流**：`/v1/responses` 入站后按上游 `endpoint` 配置分流——`responses` 直通上游；`chat` 转成 Chat Completions 打上游、响应再转回 Responses 格式（非流式 JSON / 流式 SSE 全套事件）；`auto`（默认）先直通，遇上游 404/400（端点不存在或伪实现）自动降级为 `chat` 转换重试一次
 - **响应录制器**：透写给客户端的同时缓存，请求结束时把最终输出（含格式转换后）记入日志
 - **Token 统计按日期分片**：
   - `Metrics` 内存中维护 `dict[date, TokenShard]`，按 UTC 日期自动分片

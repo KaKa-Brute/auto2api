@@ -12,6 +12,7 @@ from typing import Any, Dict, Optional, Tuple
 import httpx
 
 from . import claude as claudemod
+from . import responses as respmod
 
 
 class UpstreamError(Exception):
@@ -153,6 +154,11 @@ class Forwarder:
           - 非 2xx：outcome.error 为 UpstreamError，未提交，可 fallback
           - 传输错误：outcome.error 为普通异常，未提交
           - 2xx：outcome.response 为 Starlette 响应（committed=True，不可再 fallback）
+
+        endpoint 为 "responses"（/v1/responses 入站）时按上游 endpoint 配置分流：
+          - responses：直通打上游 /v1/responses
+          - chat：转成 Chat Completions 打上游，响应转回 Responses 格式
+          - auto（默认）：先直通，上游 404 自动降级为 chat 转换重试一次
         """
         from starlette.responses import Response, StreamingResponse
 
@@ -165,6 +171,18 @@ class Forwarder:
             return out
         if self._logger is not None and entry is not None:
             self._logger.set_upstream_request(entry, up_body)
+
+        # endpoint 模式决策（仅 /v1/responses 入站）
+        mode = ""
+        if endpoint == "responses":
+            mode = (m.cfg.upstream.endpoint or "auto").strip().lower()
+            if mode not in ("auto", "responses", "chat"):
+                mode = "auto"
+
+        if mode in ("chat",):
+            # 直接走 chat 转换管线
+            return await self._forward_chat_converted(
+                req_headers, body, m, stream_requested, entry)
 
         url = build_url(m.cfg.upstream.base_url, endpoint)
         headers = self._upstream_headers(req_headers, m)
@@ -189,6 +207,12 @@ class Forwarder:
                 await resp.aclose()
             res.status = resp.status_code
             res.duration_ms = ms(time.monotonic() - start)
+            # auto 模式下降级重试：404=端点不存在；400=伪实现（路由在但不认
+            # Responses 格式，如部分 oneapi 网关）。降级为 chat 转换重试一次，
+            # 仍失败则返回 chat 的错误。
+            if mode == "auto" and resp.status_code in (404, 400):
+                return await self._forward_chat_converted(
+                    req_headers, body, m, stream_requested, entry)
             out.error = UpstreamError(resp.status_code,
                                       err_body[:8 * 1024].decode("utf-8", "replace"))
             return out
@@ -209,6 +233,163 @@ class Forwarder:
         else:
             out.response = await self._nonstream(resp, start, res, rec)
         return out
+
+    async def _forward_chat_converted(self, req_headers, body: bytes, m,
+                                      stream_requested: bool, entry) -> ForwardOutcome:
+        """Responses 请求降级为 Chat Completions 打上游，响应转回 Responses 格式。"""
+        from starlette.responses import Response, StreamingResponse
+
+        out = ForwardOutcome()
+        res = out.result
+        try:
+            chat_body, _ = respmod.responses_request_to_chat(body)
+            chat_body = rewrite_model(chat_body, m.cfg.upstream.model)
+        except Exception as e:  # noqa: BLE001
+            out.error = RuntimeError(f"responses->chat convert: {e}")
+            return out
+        if self._logger is not None and entry is not None:
+            self._logger.set_upstream_request(entry, chat_body)
+
+        url = build_url(m.cfg.upstream.base_url, "")
+        headers = self._upstream_headers(req_headers, m)
+        timeout = httpx.Timeout(m.timeout, connect=m.timeout, read=None, write=m.timeout)
+        start = time.monotonic()
+
+        try:
+            client = self._get_client()
+            req = client.build_request("POST", url, content=chat_body,
+                                       headers=headers, timeout=timeout)
+            resp = await client.send(req, stream=True)
+        except Exception as e:  # noqa: BLE001 传输错误（DNS/连接/超时）
+            res.duration_ms = ms(time.monotonic() - start)
+            out.error = e
+            return out
+
+        if resp.status_code < 200 or resp.status_code >= 300:
+            try:
+                err_body = await resp.aread()
+            finally:
+                await resp.aclose()
+            res.status = resp.status_code
+            res.duration_ms = ms(time.monotonic() - start)
+            out.error = UpstreamError(resp.status_code,
+                                      err_body[:8 * 1024].decode("utf-8", "replace"))
+            return out
+
+        res.status = resp.status_code
+        res.upstream_model = m.cfg.upstream.model
+        res.stream = stream_requested
+        res.body_committed = True
+
+        rec = getattr(entry, "rec", None) if entry is not None else None
+
+        if stream_requested:
+            out.response = self._stream_responses(resp, m, start, res, rec)
+        else:
+            out.response = await self._nonstream_responses(resp, m, start, res, rec)
+        return out
+
+    async def _nonstream_responses(self, resp, m, start, res, rec) -> Any:
+        from starlette.responses import Response
+        try:
+            body = await resp.aread()
+        finally:
+            await resp.aclose()
+        res.duration_ms = ms(time.monotonic() - start)
+        try:
+            converted = respmod.chat_response_to_responses(body, m.cfg.upstream.model)
+            # 提取 token 用量记入指标
+            try:
+                u = json.loads(body).get("usage")
+                if isinstance(u, dict):
+                    res.prompt_tokens = int(u.get("prompt_tokens") or 0)
+                    res.completion_tokens = int(u.get("completion_tokens") or 0)
+            except (ValueError, AttributeError):
+                pass
+        except Exception:  # noqa: BLE001 转换失败：原样回退
+            if rec is not None:
+                rec.write(body)
+            headers = _copy_response_headers(resp.headers)
+            media = resp.headers.get("content-type", "application/json")
+            return Response(content=body, status_code=res.status,
+                            media_type=media, headers=headers)
+        if rec is not None:
+            rec.write(converted)
+        return Response(content=converted, status_code=200,
+                        media_type="application/json")
+
+    def _stream_responses(self, resp, m, start, res, rec) -> Any:
+        """读上游 Chat SSE，逐块转成 Responses SSE 事件推送。"""
+        from starlette.responses import StreamingResponse
+
+        st = respmod.ResponsesStreamState(m.cfg.upstream.model)
+
+        async def gen():
+            first = False
+            pending = []
+
+            def write_event(name, data):
+                b = json.dumps(data)
+                pending.append(f"event: {name}\ndata: {b}\n\n".encode("utf-8"))
+
+            try:
+                queue: asyncio.Queue = asyncio.Queue(maxsize=16)
+                reader = asyncio.ensure_future(_read_lines(resp, queue))
+                idle = m.idle_timeout
+                last_data = time.monotonic()
+                while True:
+                    try:
+                        item = await asyncio.wait_for(queue.get(), timeout=m.keepalive)
+                    except asyncio.TimeoutError:
+                        yield b": keepalive\n\n"
+                        if time.monotonic() - last_data > idle:
+                            break
+                        continue
+                    if item is None:
+                        st.finish_stream(write_event)
+                        for p in pending:
+                            if rec is not None:
+                                rec.write(p)
+                            yield p
+                        break
+                    if isinstance(item, Exception):
+                        break
+                    line = item.strip()
+                    if not line or not line.startswith("data:"):
+                        continue
+                    payload = line[len("data:"):].strip()
+                    if payload == "[DONE]":
+                        st.finish_stream(write_event)
+                        for p in pending:
+                            if rec is not None:
+                                rec.write(p)
+                            yield p
+                        break
+                    try:
+                        chunk = json.loads(payload)
+                    except ValueError:
+                        continue
+                    if not first:
+                        res.first_token_ms = ms(time.monotonic() - start)
+                        first = True
+                    last_data = time.monotonic()
+                    pending.clear()
+                    st.handle_chunk(chunk, write_event)
+                    for p in pending:
+                        if rec is not None:
+                            rec.write(p)
+                        yield p
+                reader.cancel()
+            finally:
+                res.duration_ms = ms(time.monotonic() - start)
+                # 从流式状态提取 token 用量记入指标
+                res.prompt_tokens = st.input_tokens
+                res.completion_tokens = st.output_tokens
+                await resp.aclose()
+
+        return StreamingResponse(gen(), status_code=200,
+                                 media_type="text/event-stream",
+                                 headers=_sse_headers())
 
     async def _nonstream(self, resp, start, res, rec) -> Any:
         from starlette.responses import Response

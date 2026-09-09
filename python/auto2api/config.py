@@ -55,6 +55,11 @@ class UpstreamConfig:
     api_key: str = ""           # 支持 ${ENV} 展开
     auth_header: str = ""       # Authorization（默认）/ x-api-key / x-goog-api-key
     timeout: str = ""
+    # /v1/responses 入站请求的上游端点模式：
+    #   responses —— 上游原生支持 /v1/responses，直通
+    #   chat      —— 上游仅支持 /v1/chat/completions，网关自动做 Responses↔Chat 转换
+    #   auto      ——（默认）先直通，遇上游 404 自动降级为 chat 转换重试
+    endpoint: str = ""
 
 
 @dataclass
@@ -167,6 +172,7 @@ def _model_from_dict(d: dict) -> ModelConfig:
             api_key=up.get("api_key", "") or "",
             auth_header=up.get("auth_header", "") or "",
             timeout=up.get("timeout", "") or "",
+            endpoint=up.get("endpoint", "") or "",
         ),
         retry=RetryConfig(
             count=int(rt.get("count", 0) or 0),
@@ -319,6 +325,10 @@ def load(path: str) -> Config:
             if not m.upstream.timeout:
                 m.upstream.timeout = "120s"
             parse_duration(m.upstream.timeout)
+            if m.upstream.endpoint not in ("", "auto", "responses", "chat"):
+                raise ValueError(
+                    f"chain {name!r} model {m.name!r}: endpoint 仅支持 auto/responses/chat"
+                )
         cfg.chains[name] = ChainConfig(models=models)
 
     return cfg
