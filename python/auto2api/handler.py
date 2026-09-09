@@ -54,6 +54,70 @@ def _extract_bool(body: bytes, key: str) -> bool:
     return False
 
 
+# 内容块 type -> 能力类型 映射（覆盖 OpenAI Chat / Responses 两种格式）
+_CAP_TYPE_MAP = {
+    "text": "text", "input_text": "text", "output_text": "text",
+    "summary_text": "text", "refusal": "text",
+    "image_url": "image", "input_image": "image",
+    "input_audio": "audio", "audio": "audio", "audio_url": "audio",
+    "input_file": "file", "file": "file", "file_url": "file",
+    "input_video": "video", "video": "video", "video_url": "video",
+}
+
+
+def _caps_of_content(content, caps: set) -> None:
+    """把消息 content（字符串或内容块列表）的能力类型累加进 caps。"""
+    if isinstance(content, str):
+        caps.add("text")
+        return
+    if not isinstance(content, list):
+        return
+    for b in content:
+        if not isinstance(b, dict):
+            continue
+        cap = _CAP_TYPE_MAP.get(str(b.get("type", "")))
+        if cap:
+            caps.add(cap)
+
+
+def detect_capabilities(body: bytes) -> set:
+    """从请求体检测所需的输入能力类型（text/image/audio/video/file/tool）。
+
+    同时兼容 OpenAI Chat 与 Responses 两种格式；Claude 请求已提前转为
+    OpenAI 格式，无需单独处理。任何请求都视为含 text。
+    """
+    caps = {"text"}
+    try:
+        p = json.loads(body)
+    except ValueError:
+        return caps
+    if not isinstance(p, dict):
+        return caps
+
+    # 消息列表：Chat 为 messages，Responses 为 input（可为字符串）
+    msgs = p.get("messages")
+    if isinstance(msgs, str):
+        pass  # 纯文本输入
+    elif isinstance(msgs, list):
+        for msg in msgs:
+            if not isinstance(msg, dict):
+                continue
+            _caps_of_content(msg.get("content"), caps)
+            if msg.get("role") == "tool" or msg.get("tool_call_id") \
+                    or msg.get("tool_calls"):
+                caps.add("tool")
+    inp = p.get("input")
+    if isinstance(inp, str):
+        pass
+    elif isinstance(inp, list):
+        for msg in inp:
+            if isinstance(msg, dict):
+                _caps_of_content(msg.get("content"), caps)
+    if isinstance(p.get("tools"), list) and p["tools"]:
+        caps.add("tool")
+    return caps
+
+
 class _CommittedResponse(Exception):
     """内部信号：forwarder 已提交（成功）响应，携带 Starlette 响应对象。"""
 
@@ -362,8 +426,9 @@ class Handler:
         excluded = {}
         last_err: Optional[Exception] = None
         switches = 0
+        caps = detect_capabilities(body)
         while True:
-            m = self._scheduler.select_model(chain, excluded)
+            m = self._scheduler.select_model(chain, excluded, caps)
             if m is None:
                 msg = "all models exhausted (circuit open or cooling down)"
                 if last_err is not None:

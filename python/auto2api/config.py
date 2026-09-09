@@ -100,6 +100,10 @@ class ModelConfig:
     retry: RetryConfig = field(default_factory=RetryConfig)
     failover: FailoverConfig = field(default_factory=FailoverConfig)
     stream: StreamConfig = field(default_factory=StreamConfig)
+    # 该模型支持的输入能力类型，如 ["text","image"]。
+    # 未配置或空表示支持所有类型（向后兼容）。
+    # 可选值：text / image / audio / video / file / tool
+    supports: List[str] = field(default_factory=list)
 
 
 @dataclass
@@ -199,6 +203,7 @@ def _model_from_dict(d: dict) -> ModelConfig:
             idle_timeout=sm.get("idle_timeout", "") or "",
             keepalive=sm.get("keepalive", "") or "",
         ),
+        supports=[str(x).strip() for x in (d.get("supports", []) or []) if str(x).strip()],
     )
 
 

@@ -43,6 +43,8 @@ class Model:
         self.idle_timeout = cfgmod.parse_duration(mc.stream.idle_timeout or "30s")
         self.keepalive = cfgmod.parse_duration(mc.stream.keepalive or "5s")
         self.timeout = cfgmod.parse_duration(mc.upstream.timeout or "120s")
+        # 支持的能力类型集合；空集合表示支持所有类型（向后兼容）
+        self.supports = set(mc.supports) if mc.supports else set()
 
     def cooldown_key(self) -> str:
         """冷却表/熔断表/指标表中的唯一键，按 chain::name 隔离。"""
@@ -217,12 +219,16 @@ class Scheduler:
             return HEALTH_UNKNOWN
         return h.status(m)
 
-    def pick_next(self, chain: Chain, excluded: Dict[str, bool]) -> Optional[Model]:
-        """按优先级升序返回下一个可用模型，跳过 excluded/冷却中/熔断 OPEN。"""
+    def pick_next(self, chain: Chain, excluded: Dict[str, bool],
+                  caps: Optional[set] = None) -> Optional[Model]:
+        """按优先级升序返回下一个可用模型，跳过 excluded/冷却中/熔断 OPEN/能力不匹配。"""
         with self._lock:
             now = time.monotonic()
             for m in chain.models:
                 if excluded.get(m.cfg.name):
+                    continue
+                # 能力过滤：模型 supports 为空表示全支持；非空时须覆盖所有请求能力
+                if caps and m.supports and not caps.issubset(m.supports):
                     continue
                 exp = self._cooldown.get(m.cooldown_key())
                 if exp is not None and now < exp:
@@ -235,13 +241,17 @@ class Scheduler:
                 return m
             return None
 
-    def select_model(self, chain: Chain, excluded: Dict[str, bool]) -> Optional[Model]:
+    def select_model(self, chain: Chain, excluded: Dict[str, bool],
+                     caps: Optional[set] = None) -> Optional[Model]:
         """动态路由：可用集合内按 优先级 > 健康 > 成功率 > 延迟 综合排序选最优。"""
         with self._lock:
             now = time.monotonic()
             cands = []
             for m in chain.models:
                 if excluded.get(m.cfg.name):
+                    continue
+                # 能力过滤：模型 supports 为空表示全支持；非空时须覆盖所有请求能力
+                if caps and m.supports and not caps.issubset(m.supports):
                     continue
                 exp = self._cooldown.get(m.cooldown_key())
                 if exp is not None and now < exp:

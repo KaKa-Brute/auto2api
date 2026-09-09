@@ -61,6 +61,9 @@ chains:
   auto:
     - name: gpt              # 优先级 1（最高）
       priority: 1
+      # 该模型支持的输入能力类型，可选值：text / image / audio / video / file / tool
+      # 未配置或空表示支持所有类型（向后兼容）
+      supports: [text, image, audio, tool]
       upstream:
         provider: openai
         base_url: "https://api.openai.com/v1"   # OpenAI 兼容端点会自动追加 /v1/chat/completions
@@ -81,6 +84,7 @@ chains:
 
     - name: glm             # 优先级 2
       priority: 2
+      supports: [text, tool]                  # 仅纯文本（不支持图片等多模态输入）
       upstream:
         provider: openai
         base_url: "https://open.bigmodel.cn/api/paas/v4"
