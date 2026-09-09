@@ -1,6 +1,6 @@
 """调用日志：记录完整调用过程与输入输出，按日期 + 大小轮转落盘为 JSONL。
-文件名形如 logs/calls-2026-07-20.log，
-跨天或文件超限时轮转，旧文件可 gzip 压缩，超龄自动删除。
+正常调用写入 calls-YYYY-MM-DD.log，错误调用（err 非空或响应状态非 2xx）单独写入
+errors-YYYY-MM-DD.log，两类文件独立按日期 + 大小轮转，旧文件可 gzip 压缩，超龄自动删除。
 """
 import gzip
 import json
@@ -143,14 +143,14 @@ def _truncate(s: str, limit: int) -> str:
 def _log_date_from_name(name: str) -> str:
     """从文件名提取 YYYY-MM-DD 日期。
     支持格式：calls-2026-07-29.log、calls-2026-07-29.1.log、calls-2026-07-29.1.log.gz
+    以及 errors- 同名格式。
     """
-    prefix = "calls-"
-    if not name.startswith(prefix):
-        return ""
-    rest = name[len(prefix):]
-    if len(rest) < 10:
-        return ""
-    return rest[:10]
+    for prefix in ("calls-", "errors-"):
+        if name.startswith(prefix):
+            rest = name[len(prefix):]
+            if len(rest) >= 10:
+                return rest[:10]
+    return ""
 
 
 def _is_rotated(name: str) -> bool:
@@ -158,8 +158,13 @@ def _is_rotated(name: str) -> bool:
     return ".log." in name and not name.endswith(".log")
 
 
+_LOG_PREFIXES = ("calls-", "errors-")
+
+
 class CallLogger:
-    """按日期 + 大小轮转的调用日志记录器。"""
+    """按日期 + 大小轮转的调用日志记录器。
+    正常调用写 calls-*.log，错误调用写 errors-*.log，互不混写。
+    """
 
     def __init__(self, dir_: str, enabled: bool, redact: bool,
                  upstream: bool, body_limit: int, *,
@@ -177,8 +182,8 @@ class CallLogger:
         self._max_age_days = max_age_days
         self._max_backups = max_backups
         self._compress = compress
-        self._file = None
-        self._file_date = ""
+        # 前缀 -> (文件句柄, 文件日期)
+        self._files: Dict[str, tuple] = {}
 
     def enabled(self) -> bool:
         return self._enabled
@@ -242,55 +247,60 @@ class CallLogger:
             e.resp_chunks = e.rec.chunk_count
         if err is not None:
             e.error = str(err)
-        self._write(e)
+        # 错误分流：err 非空或响应状态非 2xx 视为错误，单独写 errors-*.log
+        prefix = "errors-" if (err is not None or status < 200 or status >= 300) else "calls-"
+        self._write(e, prefix)
 
-    def _write(self, e: CallEntry) -> None:
+    def _write(self, e: CallEntry, prefix: str) -> None:
         with self._lock:
-            if not self._rotate_file():
+            f = self._rotate_file(prefix)
+            if f is None:
                 return
-            self._file.write(json.dumps(e.to_dict(), ensure_ascii=False))
-            self._file.write("\n")
-            self._file.flush()
+            f.write(json.dumps(e.to_dict(), ensure_ascii=False))
+            f.write("\n")
+            f.flush()
 
-    def _rotate_file(self) -> bool:
+    def _rotate_file(self, prefix: str):
         today = datetime.now().strftime("%Y-%m-%d")
+        f, date = self._files.get(prefix, (None, ""))
         # 跨天：关闭当前文件，清理旧文件
-        if self._file is not None and today != self._file_date:
-            self._file.close()
-            self._file = None
-            self._file_date = ""
+        if f is not None and today != date:
+            f.close()
+            f = None
+            self._files[prefix] = (None, "")
             self._cleanup()
         # 打开新文件
-        if self._file is None:
+        if f is None:
             try:
                 os.makedirs(self._dir, exist_ok=True)
-                path = os.path.join(self._dir, f"calls-{today}.log")
-                self._file = open(path, "a", encoding="utf-8")
-                self._file_date = today
+                path = os.path.join(self._dir, f"{prefix}{today}.log")
+                f = open(path, "a", encoding="utf-8")
+                self._files[prefix] = (f, today)
             except OSError:
-                return False
+                return None
         # 大小轮转：当前文件超限 → 重命名 + 压缩 + 开新文件
         if self._max_size_bytes > 0:
             try:
-                size = self._file.tell()
+                size = f.tell()
             except OSError:
                 size = 0
             if size >= self._max_size_bytes:
-                self._file.close()
-                self._rotate_and_compress(today)
+                f.close()
+                self._rotate_and_compress(prefix, today)
                 self._cleanup()
                 try:
-                    path = os.path.join(self._dir, f"calls-{today}.log")
-                    self._file = open(path, "a", encoding="utf-8")
+                    path = os.path.join(self._dir, f"{prefix}{today}.log")
+                    f = open(path, "a", encoding="utf-8")
+                    self._files[prefix] = (f, today)
                 except OSError:
-                    return False
-        return True
+                    return None
+        return f
 
-    def _rotate_and_compress(self, date: str) -> None:
+    def _rotate_and_compress(self, prefix: str, date: str) -> None:
         """将当前日志文件重命名为带序号的备份，并按需 gzip 压缩。"""
-        src = os.path.join(self._dir, f"calls-{date}.log")
+        src = os.path.join(self._dir, f"{prefix}{date}.log")
         for n in range(1, 10000):
-            dst = os.path.join(self._dir, f"calls-{date}.{n}.log")
+            dst = os.path.join(self._dir, f"{prefix}{date}.{n}.log")
             if not os.path.exists(dst) and not os.path.exists(dst + ".gz"):
                 try:
                     os.rename(src, dst)
@@ -326,7 +336,7 @@ class CallLogger:
         # 按日期分组的轮转文件
         by_date: Dict[str, list] = {}
         for name in entries:
-            if not name.startswith("calls-"):
+            if not name.startswith(_LOG_PREFIXES):
                 continue
             path = os.path.join(self._dir, name)
             try:
@@ -347,11 +357,12 @@ class CallLogger:
                             continue
                     except ValueError:
                         pass
-            # 收集轮转文件（非当前活跃文件）
+            # 收集轮转文件（非当前活跃文件），按 前缀+日期 分组
             if _is_rotated(name):
+                prefix = next((p for p in _LOG_PREFIXES if name.startswith(p)), "")
                 date_str = _log_date_from_name(name) or "_unknown"
-                by_date.setdefault(date_str, []).append((name, mtime))
-        # 按日期分组，超出 max_backups 的删最旧
+                by_date.setdefault(prefix + date_str, []).append((name, mtime))
+        # 按前缀+日期分组，超出 max_backups 的删最旧
         if self._max_backups > 0:
             for files in by_date.values():
                 if len(files) <= self._max_backups:

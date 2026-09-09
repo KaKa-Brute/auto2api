@@ -8,7 +8,8 @@ server:
     - "sk-auto2api-CHANGE_ME"     # 可配多个方便轮换；支持 ${ENV} 展开
     # - "${AUTO2API_KEY2}"
 
-# 调用日志：记录完整调用过程与输入输出，按日期 + 大小轮转（logs/calls-YYYY-MM-DD.log）
+# 调用日志：记录完整调用过程与输入输出，按日期 + 大小轮转
+# 正常调用写 logs/calls-YYYY-MM-DD.log；错误调用（出错或响应状态非 2xx）单独写 logs/errors-YYYY-MM-DD.log
 log:
   enabled: false                  # 总开关，默认关闭
   dir: "logs"                     # 日志目录（按日期 + 大小轮转）
