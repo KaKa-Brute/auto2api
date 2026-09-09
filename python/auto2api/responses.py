@@ -317,8 +317,12 @@ class ResponsesStreamState:
         self.output_index = 0            # 下一个输出项的下标
         self.msg_item_id = ""            # 当前 message 项 id（open 后有效）
         self.text_parts: List[str] = []  # 已推送的文本（用于 output_text.done 回填全文）
-        self.tool_items: Dict[str, int] = {}       # tool_call id -> output index
-        self.tool_args: Dict[str, str] = {}        # tool_call id -> 累计 arguments
+        self.tool_items: Dict[str, int] = {}       # item_id -> output index
+        self.tool_call_ids: Dict[str, str] = {}    # item_id -> 上游 call_id
+        self.tool_names: Dict[str, str] = {}       # item_id -> 工具名
+        self.tool_by_call: Dict[str, str] = {}     # 上游 call_id -> item_id
+        self.tool_by_pos: Dict[int, str] = {}      # 上游 tool index -> item_id
+        self.tool_args: Dict[str, str] = {}        # item_id -> 累计 arguments
         self.input_tokens = 0
         self.output_tokens = 0
         self.finish = ""
@@ -402,35 +406,44 @@ class ResponsesStreamState:
         })
 
     def _ensure_tool_item(self, write_event, tc: Dict[str, Any]) -> str:
-        """返回 tool_call 的 item id；无 id 且无法定位时返回空串。"""
-        tid = tc.get("id") or ""
-        if tid and tid in self.tool_items:
-            return tid
-        if not tid:
-            # 无 id 的增量（续传 arguments）：按 index 定位已存在的工具项
-            idx = tc.get("index")
-            if isinstance(idx, int):
-                for known_id, pos in self.tool_items.items():
-                    if pos == idx + 1:
-                        return known_id
-            if self.tool_items:
-                return max(self.tool_items, key=lambda k: self.tool_items[k])
+        """定位或创建工具项，返回 item id；无法定位时返回空串。
+
+        增量 chunk 中只有首个带 call_id 与工具名，后续增量（续传 arguments）
+        仅带 index 或 id 二者之一，须按 call_id / index 精确映射回已建项。
+        """
+        cid = tc.get("id") or ""
+        idx = tc.get("index")
+        if cid and cid in self.tool_by_call:
+            return self.tool_by_call[cid]
+        if isinstance(idx, int) and idx in self.tool_by_pos:
+            item_id = self.tool_by_pos[idx]
+            # 首 chunk 缺 id 的少见场景：补记映射
+            if cid:
+                self.tool_by_call[cid] = item_id
+                self.tool_call_ids[item_id] = cid
+            return item_id
+        if not cid:
             return ""
-        # 先关掉进行中的 message 项，工具项排在其后
+        # 新工具项：先关掉进行中的 message 项，工具项排在其后
         self._close_message_item(write_event)
         item_id = "fc_" + new_rand_id()
         pos = self.output_index
         self.output_index += 1
         fn = tc.get("function") if isinstance(tc.get("function"), dict) else {}
+        self.tool_items[item_id] = pos
+        self.tool_call_ids[item_id] = cid
+        self.tool_names[item_id] = fn.get("name") or ""
+        if isinstance(idx, int):
+            self.tool_by_pos[idx] = item_id
+        self.tool_by_call[cid] = item_id
+        self.tool_args[item_id] = ""
         write_event("response.output_item.added", {
             "type": "response.output_item.added",
             "output_index": pos,
-            "item": {"type": "function_call", "id": item_id, "call_id": tid,
+            "item": {"type": "function_call", "id": item_id, "call_id": cid,
                       "name": fn.get("name") or "", "arguments": "",
                       "status": "in_progress"},
         })
-        self.tool_items[item_id] = pos
-        self.tool_args[item_id] = ""
         return item_id
 
     def _close_message_item(self, write_event) -> None:
@@ -460,14 +473,27 @@ class ResponsesStreamState:
                       "content": [{"type": "output_text", "text": full_text,
                                     "annotations": []}]},
         })
+        # 记录已完成项（response.completed 回填 output 用）
+        self.closed_msg = {"type": "message", "id": self.msg_item_id,
+                           "status": "completed", "role": "assistant",
+                           "content": [{"type": "output_text", "text": full_text,
+                                         "annotations": []}]}
         self.msg_item_id = ""
         self.text_parts = []
 
     def finish_stream(self, write_event) -> None:
         """上游结束，补完 Responses 终止事件序列。"""
         self._close_message_item(write_event)
+        done_items: List[Any] = []
         for item_id, idx in sorted(self.tool_items.items(), key=lambda kv: kv[1]):
             args = self.tool_args.get(item_id, "")
+            done_item = {
+                "type": "function_call", "id": item_id,
+                "call_id": self.tool_call_ids.get(item_id, ""),
+                "name": self.tool_names.get(item_id, ""),
+                "arguments": args, "status": "completed",
+            }
+            done_items.append(done_item)
             if args:
                 write_event("response.function_call_arguments.done", {
                     "type": "response.function_call_arguments.done",
@@ -476,12 +502,13 @@ class ResponsesStreamState:
             write_event("response.output_item.done", {
                 "type": "response.output_item.done",
                 "output_index": idx,
-                "item": {"type": "function_call", "id": item_id,
-                          "arguments": args, "status": "completed"},
+                "item": done_item,
             })
         status = "incomplete" if self.finish == "length" else "completed"
         resp = self._response_base()
         resp["status"] = status
+        # 回填本回合全部输出项（message + function_call），codex 依赖此字段取工具调用
+        resp["output"] = self.final_output_items()
         resp["usage"] = {
             "input_tokens": self.input_tokens,
             "input_tokens_details": {"cached_tokens": 0},
@@ -490,6 +517,30 @@ class ResponsesStreamState:
             "total_tokens": self.input_tokens + self.output_tokens,
         }
         write_event("response.completed", {"type": "response.completed", "response": resp})
+
+    def final_output_items(self) -> List[Any]:
+        """汇总本回合全部输出项（供 response.completed 与非流式响应共用）。"""
+        items: List[Any] = []
+        # message 项：已关闭用快照；未关闭（上游未触发 close，如 [DONE] 前）
+        if self.msg_item_id:
+            full_text = "".join(self.text_parts)
+            items.append({
+                "type": "message", "id": self.msg_item_id,
+                "status": "completed", "role": "assistant",
+                "content": [{"type": "output_text", "text": full_text,
+                              "annotations": []}],
+            })
+        elif getattr(self, "closed_msg", None):
+            items.append(self.closed_msg)
+        for item_id, _idx in sorted(self.tool_items.items(), key=lambda kv: kv[1]):
+            items.append({
+                "type": "function_call", "id": item_id,
+                "call_id": self.tool_call_ids.get(item_id, ""),
+                "name": self.tool_names.get(item_id, ""),
+                "arguments": self.tool_args.get(item_id, ""),
+                "status": "completed",
+            })
+        return items
 
     def _response_base(self) -> Dict[str, Any]:
         return {
