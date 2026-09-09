@@ -115,7 +115,7 @@ curl http://localhost:8080/v1/health
 
 > **Claude 兼容说明**：`/v1/messages` 入站为 Claude 格式，内部转成 OpenAI 格式走上游（上游须为 OpenAI 兼容端点），响应再转回 Claude 格式。支持 system 顶层、文本/图片内容块、工具调用（tool_use/tool_result）、stop_sequences 映射，流式 SSE 事件（message_start / content_block_delta / message_delta / message_stop）全套转换。
 
-> **Responses 兼容说明**：`/v1/responses` 入站为 Responses API 格式，按上游 `endpoint` 配置分流（见上表）。上游原生支持时直通；仅支持 Chat Completions 的上游自动把请求转成 Chat 格式、响应（含流式 SSE：response.created / output_item.added / content_part.added / output_text.delta / output_item.done / response.completed）转回 Responses 格式。`auto` 模式先试直通，遇上游 404/400（端点不存在或伪实现）自动降级为 Chat 转换。支持 input 字符串/消息列表、instructions、工具调用（function_call / function_call_output）、流式与非流式。
+> **Responses 兼容说明**：`/v1/responses` 入站为 Responses API 格式，按上游 `endpoint` 配置分流（见上表）。上游原生支持时直通；仅支持 Chat Completions 的上游自动把请求转成 Chat 格式、响应（含流式 SSE：response.created / output_item.added / content_part.added / output_text.delta / output_item.done / response.completed）转回 Responses 格式。`auto` 模式先试直通，遇上游 404/400/422（端点不存在或伪实现）自动降级为 Chat 转换。支持 input 字符串/消息列表、instructions、工具调用（function_call / function_call_output）、reasoning/developer 兼容处理、流式与非流式。
 
 > **两层鉴权**：客户端的 `Authorization`/`x-api-key` 用于**服务级鉴权**（须匹配 `server.api_keys`），通过后被剥离；转发上游时由 [forwarder](file:///d:\desktop\ai_coding\auto2api\python\auto2api\forwarder.py) 用每个模型配置的 `api_key` 重新注入。
 
@@ -224,6 +224,9 @@ chains:
         auth_header: "Authorization"  # 默认；或 x-api-key / x-goog-api-key
         timeout: "120s"
         endpoint: "auto"              # 仅 /v1/responses 入站：auto(探测)/responses(直通)/chat(转换)
+        extra_body:                   # 追加到上游请求体的固定参数（浅合并，覆盖客户端传参）
+          thinking:                   # 例：关闭思考模式，避免 reasoning_content 浪费 token
+            type: disabled            # GLM/DeepSeek 用 thinking；Qwen 用 enable_thinking: false
       retry:
         count: 2                       # 同模型内重试次数（不含首次）
         backoff: ["300ms","600ms","1.2s"]   # 指数退避，封顶 3s
@@ -266,7 +269,8 @@ chains:
 | `protection.memory_check_interval` | `10s` | 内存检查周期 |
 | `upstream.timeout` | `120s` | 上游请求超时 |
 | `upstream.auth_header` | `Authorization` | 鉴权头类型 |
-| `upstream.endpoint` | `auto` | 仅 `/v1/responses` 入站生效：`responses` 直通上游 `/v1/responses`；`chat` 转成 Chat Completions 调用并转换响应；`auto` 先直通，上游 404/400 时自动降级为 `chat` |
+| `upstream.endpoint` | `auto` | 仅 `/v1/responses` 入站生效：`responses` 直通上游 `/v1/responses`；`chat` 转成 Chat Completions 调用并转换响应；`auto` 先直通，上游 404/400/422 时自动降级为 `chat` |
+| `upstream.extra_body` | `{}` | 追加到上游请求体的固定参数（浅合并，同名参数覆盖客户端传参）。典型用途：关闭默认开启思考的模型省 token——GLM/DeepSeek 配 `thinking: {type: disabled}`，Qwen 配 `enable_thinking: false` |
 | `failover.cooldown` | `60s` | 失败模型冷却时长 |
 | `stream.idle_timeout` | `30s` | SSE 空闲超时 |
 | `stream.keepalive` | `5s` | SSE keepalive 间隔 |
@@ -334,7 +338,7 @@ auto2api/
 - **头部白名单 + 鉴权注入**：手动构造上游请求（非反向代理），精确控制透传头部与模型改写
 - **冷却键 `chain::name`**：按链隔离，避免跨链同名模型互相污染
 - **出站格式标记**：`/v1/messages` 置 `outbound_format=claude`，forwarder 据此分流 Claude 转换管线
-- **Responses 端点分流**：`/v1/responses` 入站后按上游 `endpoint` 配置分流——`responses` 直通上游；`chat` 转成 Chat Completions 打上游、响应再转回 Responses 格式（非流式 JSON / 流式 SSE 全套事件）；`auto`（默认）先直通，遇上游 404/400（端点不存在或伪实现）自动降级为 `chat` 转换重试一次
+- **Responses 端点分流**：`/v1/responses` 入站后按上游 `endpoint` 配置分流——`responses` 直通上游；`chat` 转成 Chat Completions 打上游、响应再转回 Responses 格式（非流式 JSON / 流式 SSE 全套事件）；`auto`（默认）先直通，遇上游 404/400/422（端点不存在或伪实现）自动降级为 `chat` 转换重试一次
 - **响应录制器**：透写给客户端的同时缓存，请求结束时把最终输出（含格式转换后）记入日志
 - **Token 统计按日期分片**：
   - `Metrics` 内存中维护 `dict[date, TokenShard]`，按 UTC 日期自动分片

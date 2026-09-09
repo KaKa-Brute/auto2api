@@ -64,27 +64,61 @@ def responses_request_to_chat(body: bytes) -> Tuple[bytes, str]:
 
 
 def _convert_input_messages(msgs: List[Any]) -> List[Any]:
-    """转换 Responses input 消息列表为 Chat messages。"""
+    """转换 Responses input 消息列表为 Chat messages。
+
+    兼容 codex 等客户端回放的历史项：
+    - 顶层 function_call 项 → assistant tool_calls 消息
+    - reasoning 项（思维链回放）→ 丢弃（Chat 无对应）
+    - function_call_output → role=tool
+    - developer 角色 → system
+    """
     out: List[Any] = []
     for raw in msgs:
         if not isinstance(raw, dict):
             continue
         role = raw.get("role")
+        itype = raw.get("type") if isinstance(raw.get("type"), str) else ""
         # Responses 的 function_call_output / 本地工具结果 → Chat role=tool
-        if role == "function_call_output" or raw.get("type") == "function_call_output":
+        if role == "function_call_output" or itype == "function_call_output":
             out.append({
                 "role": "tool",
                 "tool_call_id": raw.get("call_id") or "",
                 "content": _content_to_text(raw.get("output")),
             })
             continue
-        m: Dict[str, Any] = {"role": role if isinstance(role, str) else "user"}
+        # 顶层 function_call 项（codex 历史回放）→ assistant tool_calls 消息
+        if itype == "function_call":
+            args = raw.get("arguments")
+            if not isinstance(args, str):
+                args = json.dumps(args or {})
+            out.append({
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [{
+                    "id": raw.get("call_id") or raw.get("id") or "",
+                    "type": "function",
+                    "function": {"name": raw.get("name") or "", "arguments": args},
+                }],
+            })
+            continue
+        # reasoning 项（思维链回放）→ Chat 无对应，丢弃
+        if itype == "reasoning" or role == "reasoning":
+            continue
+        # 无 role 且非 message 类型（local_shell_call 等）→ 跳过
+        if not isinstance(role, str) and itype not in ("", "message"):
+            continue
+        r = role if isinstance(role, str) else "user"
+        if r == "developer":
+            r = "system"
+        m: Dict[str, Any] = {"role": r}
         content = _convert_content(raw.get("content"))
-        if content is not None:
-            m["content"] = content
         # assistant 的 function_call（历史回放）→ tool_calls
         fc = raw.get("function_call")
         if isinstance(fc, dict):
+            if content is not None:
+                m["content"] = content
+            else:
+                m["content"] = None
             args = fc.get("arguments")
             if not isinstance(args, str):
                 args = json.dumps(args)
@@ -93,7 +127,12 @@ def _convert_input_messages(msgs: List[Any]) -> List[Any]:
                 "type": "function",
                 "function": {"name": fc.get("name") or "", "arguments": args},
             }]
-            m.setdefault("content", None)
+            out.append(m)
+            continue
+        if content is None:
+            # 无内容无工具调用：丢弃，避免产生非法空消息
+            continue
+        m["content"] = content
         out.append(m)
     return out
 

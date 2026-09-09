@@ -5,7 +5,7 @@
 import os
 import re
 from dataclasses import dataclass, field
-from typing import Dict, List
+from typing import Any, Dict, List
 
 import yaml
 
@@ -60,6 +60,17 @@ class UpstreamConfig:
     #   chat      —— 上游仅支持 /v1/chat/completions，网关自动做 Responses↔Chat 转换
     #   auto      ——（默认）先直通，遇上游 404 自动降级为 chat 转换重试
     endpoint: str = ""
+    # 追加合并到上游请求体的额外字段（浅合并，配置优先于客户端传参）。
+    # 用途示例：关闭默认开启思考的模型，避免 reasoning_content 浪费 token：
+    #   GLM:   extra_body: {thinking: {type: disabled}}
+    #   Qwen:  extra_body: {enable_thinking: false}
+    #   DeepSeek: extra_body: {thinking: {type: disabled}}  或 enable_thinking: false
+    extra_body: Dict[str, Any] = field(default_factory=dict)
+
+
+def _load_extra_body(v: Any) -> Dict[str, Any]:
+    """把 YAML 中的 extra_body 值规整为 dict（非 dict 直接忽略）。"""
+    return dict(v) if isinstance(v, dict) else {}
 
 
 @dataclass
@@ -173,6 +184,7 @@ def _model_from_dict(d: dict) -> ModelConfig:
             auth_header=up.get("auth_header", "") or "",
             timeout=up.get("timeout", "") or "",
             endpoint=up.get("endpoint", "") or "",
+            extra_body=_load_extra_body(up.get("extra_body")),
         ),
         retry=RetryConfig(
             count=int(rt.get("count", 0) or 0),

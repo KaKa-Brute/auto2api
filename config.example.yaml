@@ -87,6 +87,13 @@ chains:
         api_key: "${GLM_KEY}"
         auth_header: "Authorization"
         timeout: "120s"
+        # 追加到上游请求体的固定参数（浅合并，同名参数覆盖客户端传参）
+        # 典型用途：关闭默认开启思考模式的模型，避免 reasoning_content 浪费 token：
+        #   GLM/DeepSeek: thinking: {type: disabled}
+        #   Qwen:        enable_thinking: false
+        extra_body:
+          thinking:
+            type: disabled
       retry:
         count: 2
         backoff: ["300ms", "600ms"]

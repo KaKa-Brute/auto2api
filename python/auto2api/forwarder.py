@@ -85,12 +85,18 @@ def set_auth_headers(headers: Dict[str, str], auth_header: str, api_key: str) ->
         headers[auth_header] = api_key
 
 
-def rewrite_model(body: bytes, new_model: str) -> bytes:
-    """用上游真实模型名改写 body 的 model 字段，保留其余字段。"""
+def rewrite_model(body: bytes, new_model: str, extra_body: Optional[dict] = None) -> bytes:
+    """用上游真实模型名改写 body 的 model 字段，保留其余字段。
+
+    extra_body 非空时浅合并进请求体（配置优先于客户端传参），
+    用于按模型注入固定参数，如关闭思考：{thinking: {type: disabled}}。
+    """
     obj = json.loads(body)
     if not isinstance(obj, dict):
         obj = {}
     obj["model"] = new_model
+    if extra_body:
+        obj.update(extra_body)
     return json.dumps(obj).encode("utf-8")
 
 
@@ -165,7 +171,8 @@ class Forwarder:
         out = ForwardOutcome()
         res = out.result
         try:
-            up_body = rewrite_model(body, m.cfg.upstream.model)
+            up_body = rewrite_model(body, m.cfg.upstream.model,
+                                    m.cfg.upstream.extra_body or None)
         except Exception as e:  # noqa: BLE001
             out.error = RuntimeError(f"rewrite model: {e}")
             return out
@@ -207,10 +214,10 @@ class Forwarder:
                 await resp.aclose()
             res.status = resp.status_code
             res.duration_ms = ms(time.monotonic() - start)
-            # auto 模式下降级重试：404=端点不存在；400=伪实现（路由在但不认
-            # Responses 格式，如部分 oneapi 网关）。降级为 chat 转换重试一次，
-            # 仍失败则返回 chat 的错误。
-            if mode == "auto" and resp.status_code in (404, 400):
+            # auto 模式下降级重试：404=端点不存在；400/422=伪实现（路由在但不认
+            # Responses 格式，如部分 oneapi 网关，codex CLI 常见 422 openai_error）。
+            # 降级为 chat 转换重试一次，仍失败则返回 chat 的错误。
+            if mode == "auto" and resp.status_code in (404, 400, 422):
                 return await self._forward_chat_converted(
                     req_headers, body, m, stream_requested, entry)
             out.error = UpstreamError(resp.status_code,
@@ -243,7 +250,8 @@ class Forwarder:
         res = out.result
         try:
             chat_body, _ = respmod.responses_request_to_chat(body)
-            chat_body = rewrite_model(chat_body, m.cfg.upstream.model)
+            chat_body = rewrite_model(chat_body, m.cfg.upstream.model,
+                                      m.cfg.upstream.extra_body or None)
         except Exception as e:  # noqa: BLE001
             out.error = RuntimeError(f"responses->chat convert: {e}")
             return out
