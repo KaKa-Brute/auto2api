@@ -90,13 +90,19 @@ def rewrite_model(body: bytes, new_model: str, extra_body: Optional[dict] = None
 
     extra_body 非空时浅合并进请求体（配置优先于客户端传参），
     用于按模型注入固定参数，如关闭思考：{thinking: {type: disabled}}。
+    值为 null 的键表示删除客户端传入的同名字段，
+    用于清理与配置冲突的参数（如 thinking.type=disabled 时删 reasoning_effort）。
     """
     obj = json.loads(body)
     if not isinstance(obj, dict):
         obj = {}
     obj["model"] = new_model
     if extra_body:
-        obj.update(extra_body)
+        for k, v in extra_body.items():
+            if v is None:
+                obj.pop(k, None)
+            else:
+                obj[k] = v
     return json.dumps(obj).encode("utf-8")
 
 

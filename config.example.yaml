@@ -96,9 +96,12 @@ chains:
         # 典型用途：关闭默认开启思考模式的模型，避免 reasoning_content 浪费 token：
         #   GLM/DeepSeek: thinking: {type: disabled}
         #   Qwen:        enable_thinking: false
+        # 值为 null 的键表示删除客户端传的同名字段（如客户端传了 reasoning_effort
+        # 会与 thinking.type=disabled 冲突，被上游拒 400，需显式清掉）
         extra_body:
           thinking:
             type: disabled
+          reasoning_effort: null
       retry:
         count: 2
         backoff: ["300ms", "600ms"]

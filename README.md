@@ -227,6 +227,7 @@ chains:
         extra_body:                   # 追加到上游请求体的固定参数（浅合并，覆盖客户端传参）
           thinking:                   # 例：关闭思考模式，避免 reasoning_content 浪费 token
             type: disabled            # GLM/DeepSeek 用 thinking；Qwen 用 enable_thinking: false
+          reasoning_effort: null      # 值为 null 的键 = 删除客户端传的同名字段（防与 thinking 冲突被拒 400）
       retry:
         count: 2                       # 同模型内重试次数（不含首次）
         backoff: ["300ms","600ms","1.2s"]   # 指数退避，封顶 3s
@@ -270,7 +271,7 @@ chains:
 | `upstream.timeout` | `120s` | 上游请求超时 |
 | `upstream.auth_header` | `Authorization` | 鉴权头类型 |
 | `upstream.endpoint` | `auto` | 仅 `/v1/responses` 入站生效：`responses` 直通上游 `/v1/responses`；`chat` 转成 Chat Completions 调用并转换响应；`auto` 先直通，上游 404/400/422 时自动降级为 `chat` |
-| `upstream.extra_body` | `{}` | 追加到上游请求体的固定参数（浅合并，同名参数覆盖客户端传参）。典型用途：关闭默认开启思考的模型省 token——GLM/DeepSeek 配 `thinking: {type: disabled}`，Qwen 配 `enable_thinking: false` |
+| `upstream.extra_body` | `{}` | 追加到上游请求体的固定参数（浅合并，同名参数覆盖客户端传参；值为 `null` 的键表示删除客户端传的同名字段）。典型用途：关闭默认开启思考的模型省 token——GLM/DeepSeek 配 `thinking: {type: disabled}` + `reasoning_effort: null`（清掉客户端冲突参数），Qwen 配 `enable_thinking: false` |
 | `failover.cooldown` | `60s` | 失败模型冷却时长 |
 | `stream.idle_timeout` | `30s` | SSE 空闲超时 |
 | `stream.keepalive` | `5s` | SSE keepalive 间隔 |
